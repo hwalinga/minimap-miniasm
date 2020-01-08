@@ -4,6 +4,7 @@
 Minimap and miniasm.
 """
 
+import heapq
 import sys
 from collections import defaultdict, deque
 from functools import partial
@@ -471,8 +472,43 @@ def trim_overhang(mapping_list, min_coverage):
 def map_on_strand(coords, min_coverage):
     """
     Trim the coordinates for minimum coverage.
+
+    We do this by looping over the collection in sorted order of the first
+    coordinate. We keep a priority queue with the end coordinates of the
+    ranges. Each time we process a new range, we remove all the end coordinates
+    that are before the beginning of the current range. Now the size of the
+    priority queue is equal to the coverage.
     """
-    cov = 0
+    # Use heapq as a min heap to use as a priority qeueu
+    end_coords = []
+    trimmed_range_start = []
+    trimmed_range_end = []
+    in_range = False
+    for b, e in sorted(coords, key=itemgetter(0)):
+
+        # Remove all end_coords that are behind the begin of the current range.
+        while end_coords and end_coords[0] < b:
+            last_end = heapq.heappop(end_coords)
+
+            # If this removing, reduces the coverage below min_coverage and we were
+            # in_range, add the last removed end as the end of the trimmed_range.
+            if len(end_coords) < min_coverage:
+                if in_range:
+                    trimmed_range_end.append(last_end)
+                    in_range = False
+
+        # Now add the new end coord to the end_coords
+        heapq.heappush(end_coords, e)
+
+        # If this new range bring the coverage on or over the min_coverage, and we
+        # were not in range, start a new range with the beginning of the current range.
+        if len(end_coords) >= min_coverage:
+            if not in_range:
+                trimmed_range_start.append(b)
+                in_range = True
+
+    # Now return the maximum range with min_coverage
+    return max(zip(trimmed_range_start, trimmed_range_end), key=lambda c: c[1] - c[0])
 
 
 def classify_overlap(overhangs, max_overhang, max_overhang_ratio):

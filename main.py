@@ -5,7 +5,7 @@ Minimap and miniasm.
 """
 
 import sys
-from collections import deque
+from collections import defaultdict, deque
 from functools import partial
 from itertools import groupby, islice, repeat, tee
 from operator import itemgetter
@@ -301,7 +301,6 @@ def overlap_hit(minimizer_hits: List[Tuple[int, int, int, int]]):
     5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
     6	string	Target sequence name
     7	int	Target sequence length
-    8	int	Target start coordinate on the original strand
     9	int	Target end coordinate on the original strand
     10	int	Number of matching bases in the mapping
     11	int	Number bases, including gaps, in the mapping
@@ -352,12 +351,12 @@ def read_fastx(file: str, format: str) -> Iterator[Tuple[str, str]]:
                 yield seq_name, seq
 
 
-def minimap(target_seq_file, query_seq_file, output_file_name):
+def minimap(target_seq_file_name, query_seq_file_name, output_file_name):
     """
     This is the minimap function
     """
-    target_seqs = read_fastx(target_seq_file, format="fastq")
-    query_seqs = read_fastx(query_seq_file, format="fastq")
+    target_seqs = read_fastx(target_seq_file_name, format="fastq")
+    query_seqs = read_fastx(query_seq_file_name, format="fastq")
 
     k = 6
     w = 6
@@ -369,7 +368,7 @@ def minimap(target_seq_file, query_seq_file, output_file_name):
 
     H, target_seq_info = index_targets(target_seqs, minimizer_sketch)
 
-    with open(output_file_name) as f:
+    with open(output_file_name, "w") if output_file_name else sys.stdout as out:
         for query_name, query_seq in query_seqs:
             for t in map_query(
                 query_seq,
@@ -381,7 +380,7 @@ def minimap(target_seq_file, query_seq_file, output_file_name):
                 min_subset,
                 min_overlap,
             ):
-                print(*t, seq="\t", file=f)
+                print(*t, seq="\t", file=out)
 
 
 ###########
@@ -391,21 +390,103 @@ def minimap(target_seq_file, query_seq_file, output_file_name):
 
 def read_paf_file(paf_file):
     """
-    ...
+    Just read the file and yields each line as a paf tuple.
+
+    Return PAF tuple
+    1	string	Query sequence name
+    2	int	Query sequence length
+    3	int	Query start coordinate (0-based)
+    4	int	Query end coordinate (0-based)
+    5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
+    6	string	Target sequence name
+    7	int	Target sequence length
+    9	int	Target end coordinate on the original strand
+    10	int	Number of matching bases in the mapping
+    11	int	Number bases, including gaps, in the mapping
+    12	int	Mapping quality (0-255 with 255 for missing)
     """
-    pass
+    for paf_line in paf_file:
+        paf_tuple = paf_line.strip().split("\t")
+        yield paf_tuple[:11]  # discard mapping quality, and additional fields.
 
 
 def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
     """
-    ...
+    Step 2.1
+
+    Remove all pafs that have an overlap too small and/or a matching region
+    too small.
+
+    Returns
+    -------
+    pafs
+    """
+    return filter(lambda p: p[9] > min_matching_bp and p[10] > min_overlap_size, pafs)
+
+
+Mappings = Dict[Tuple[str, str, str], List[Tuple[int, int, int, int]]]
+Trimmed_Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
+
+
+def filter_overlaps(pafs, min_coverage):
+    """
+    Step 2.1
+
+    This function gathers all pafs and only returns those overlaps that
+    have the minimum coverage. It will also trim the mapping outside the
+    region with not enough coverage.
+
+    Returns
+    ------
+    overhangs : dict
+        The overhangs are a dictionary with as a key the query->target mapping
+        with strand char and as a value a list with tuples
+        with qstart, qend, tstart, tend.
+    """
+    mappings: Mappings = defaultdict(list)
+    for p in pafs:
+        mappings[p[0], p[5], p[4]].append((p[2], p[3], p[7], p[8]))
+
+    trimmed_mappings: Trimmed_Mappings = dict()
+    for key, mappings_list in mappings.items():
+        mapping = trim_overhang(mappings_list, min_coverage)
+        if mappings:  # Function returns None if not enough coverage.
+            trimmed_mappings[key] = mapping
+
+
+def trim_overhang(mapping_list, min_coverage):
+    """
+    Trim the mappings where the min_coverage is not achieved. If there will
+    be no mapping left after trimming return None.
+    """
+    q_map_strand = map_on_strand(((m[0], m[1]) for m in mapping_list), min_coverage)
+    t_map_strand = map_on_strand(((m[2], m[3]) for m in mapping_list), min_coverage)
+
+    if q_map_strand and t_map_strand:
+        return (*q_map_strand, *t_map_strand)
+    else:
+        return None
+
+
+def map_on_strand(coords, min_coverage):
+    """
+    Trim the coordinates for minimum coverage.
+    """
+    cov = 0
+
+
+def classify_overlap(overhangs, max_overhang, max_overhang_ratio):
+    """
+    Step 2.2; Algorithm 5
+
+    This function finds the overlaps with the correct characteristics.
     """
     pass
 
 
-def create_genome_graph(cleaned_pafs, min_coverage):
+def create_genome_graph(overhangs):
     """
-    ...
+    Step 2.2
     """
     pass
 
@@ -434,6 +515,16 @@ def popping_bubbles(genome_graph, min_size_tip):
     pass
 
 
+def create_unitigs(genome_graph):
+    """
+    ...
+    """
+    pass
+
+
+# Print to file functions.
+
+
 def print_gfa_file(genome_graph, read_file, output_gfa_file):
     """
     ...
@@ -441,29 +532,45 @@ def print_gfa_file(genome_graph, read_file, output_gfa_file):
     pass
 
 
-def miniasm(paf_file, read_file, output_gfa_file):
+def miniasm(paf_file_name, reads_file_name, output_gfa):
     """
     This is the miniasm function
     """
+    # Overlap classification parameters
     min_overlap_size = 2000
     min_matching_bp = 100
+    max_overhang = 1000
+    max_overhang_ratio = 0.8
     min_coverage = 3
+
+    # Graph cleaning paramaters
     min_size_tip = 4
     fuzz = 10
     d = 50000  # Something with the bubbles
 
     # Create graph from pafs
-    pafs = read_paf_file(paf_file)
-    cleaned_pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
-    genome_graph = create_genome_graph(cleaned_pafs, min_coverage)
+    with open(paf_file_name) as paf_file:
+        pafs = read_paf_file(paf_file)
 
-    # Graph cleaning
+        # 2.1
+        pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
+        mappings = filter_overlaps(pafs, min_coverage)
+
+    # 2.2
+    overhangs = classify_overlap(mappings, max_overhang, max_overhang_ratio)
+    genome_graph = create_genome_graph(overhangs)
+
+    # Graph cleaning (2.3)
     genome_graph = remove_transitive_edges(genome_graph, fuzz)
     genome_graph = remove_small_tips(genome_graph, min_size_tip)
     genome_graph = popping_bubbles(genome_graph, d)
+    unitig_genome_graph = create_unitigs(genome_graph)
 
     # Convert to gfa format
-    print_gfa_file(genome_graph, read_file, output_gfa_file)
+    with open(reads_file_name) as reads_file:
+        read_seqs = read_fastx(reads_file, "fastq")
+        with open(output_gfa, "w") if output_gfa else sys.stdout as out:
+            print_gfa_file(unitig_genome_graph, read_seqs, out)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+    """
+    Return PAF tuple
+    1	string	Query sequence name
+    2	int	Query sequence length
+    3	int	Query start coordinate (0-based)
+    4	int	Query end coordinate (0-based)
+    5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
+    6	string	Target sequence name
+    7	int	Target sequence length
+    8	int	Target start coordinate on the original strand
+    9	int	Target end coordinate on the original strand
+    10	int	Number of matching bases in the mapping
+    11	int	Number bases, including gaps, in the mapping
+    12	int	Mapping quality (0-255 with 255 for missing)
+    """

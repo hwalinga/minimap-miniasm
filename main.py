@@ -11,7 +11,30 @@ from itertools import groupby, islice, repeat, tee
 from operator import itemgetter
 from typing import Callable, Dict, Iterable, Iterator, List, Set, Tuple
 
+###########
+# MINIMAP #
+###########
+
 complement = str.maketrans("ACGT", "TGCA")
+
+
+# Type aliases minimap
+
+# A set with tuples representing the hash value, the position, and the strand.
+Minimizers = Set[Tuple[int, int, bool]]
+
+# A function that takes a sequence and returns the minimizers.
+Minimizer_Sketch = Callable[[str], Minimizers]
+
+# A function that takes a sequence and returns a hash integer.
+Seq_Hash = Callable[[str], int]
+
+# A dictionary that maps the hash to a list of tuples with
+# target sequence id, position, and strand.
+Target_Index = Dict[int, List[Tuple[int, int, bool]]]
+
+# A list with a tuple with the name, and the lenght of the sequences.
+Seq_Info = List[Tuple[str, int]]
 
 
 def reverse_complement(s: str) -> str:
@@ -110,14 +133,6 @@ def invertable_hash(x: int, p: int) -> int:
     return x
 
 
-Minimizers = Set[Tuple[int, int, bool]]
-Seq_Hash = Callable[[str], int]
-Minimizer_Sketch = Callable[[str], Minimizers]
-Target_Index = Dict[int, List[Tuple[int, int, bool]]]
-# A list with a tuple with the name, and the lenght of the sequences.
-Seq_Info = List[Tuple[str, int]]
-
-
 def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizers:
     """
     Compute the (w, k)-minimizers.
@@ -178,6 +193,18 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
 def get_func_minimizer_sketch(w: int, k: int) -> Minimizer_Sketch:
     """
     A function to set all values to the :func:`compute_minimizers` function.
+
+    Paramaters
+    ----------
+    w : int
+        Amount of k-mers in window.
+    k : int
+        Length of the k-mer.
+
+    Returns
+    -------
+    minimizer_sketch : Minimizer_Sketch
+        A function that takes a sequence and returns the minimizers
     """
     return partial(
         compute_minimizers,
@@ -199,17 +226,16 @@ def index_targets(
 
         seq_info.append((name, len(seq)))
 
-        M = minimizer_sketch(s)
+        M = minimizer_sketch(seq)
         for h, i, r in M:
             H_list.append((h, (t, i, r)))
 
     H_list.sort(key=itemgetter(0))
 
-    # By using the dict.fromkeys function, the growth phase of the dict is streamlined.
-    H_dict = dict.fromkeys(map(itemgetter(0), H_list))
-
-    for h, vals in groupby(H_list, key=itemgetter(0)):
-        H_dict[h] = list(vals)
+    H_dict = {
+        h: list(map(itemgetter(1), vals))
+        for h, vals in groupby(H_list, key=itemgetter(0))
+    }
 
     return H_dict, seq_info
 
@@ -265,12 +291,6 @@ def map_query(
                 yield res
 
 
-def map_all_queries(query_seqs):
-    """
-    ...
-    """
-
-
 def overlap_hit(minimizer_hits: List[Tuple[int, int, int, int]]):
     """
     Return PAF tuple
@@ -307,6 +327,12 @@ def read_fastx(file: str, format: str) -> Iterator[Tuple[str, str]]:
     Currently, this function just assumes for fasta that the sequences and the
     fasta header are on alternating lines.
 
+    Parameters
+    file : str
+        Name of the input file.
+    format : str
+        The format ("fasta" or "fastq")
+
     Returns
     -------
     it : Iterator[Tuple[str, str]]
@@ -322,7 +348,7 @@ def read_fastx(file: str, format: str) -> Iterator[Tuple[str, str]]:
         for ind, line in ind_line:
             if ind % group_size == 0:
                 seq_name = line.strip()
-                _, seq = next(ind_line).strip()
+                _, seq = next(ind_line)[1].strip()
                 yield seq_name, seq
 
 
@@ -358,10 +384,86 @@ def minimap(target_seq_file, query_seq_file, output_file_name):
                 print(*t, seq="\t", file=f)
 
 
-def miniasm(paf_file):
+###########
+# MINIASM #
+###########
+
+
+def read_paf_file(paf_file):
+    """
+    ...
+    """
+    pass
+
+
+def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
+    """
+    ...
+    """
+    pass
+
+
+def create_genome_graph(cleaned_pafs, min_coverage):
+    """
+    ...
+    """
+    pass
+
+
+# Graph cleaning functions.
+
+
+def remove_transitive_edges(genome_graph, fuzz):
+    """
+    Myers 2005
+    """
+    pass
+
+
+def remove_small_tips(genome_graph, min_size_tip):
+    """
+    ...
+    """
+    pass
+
+
+def popping_bubbles(genome_graph, min_size_tip):
+    """
+    ...
+    """
+    pass
+
+
+def print_gfa_file(genome_graph, read_file, output_gfa_file):
+    """
+    ...
+    """
+    pass
+
+
+def miniasm(paf_file, read_file, output_gfa_file):
     """
     This is the miniasm function
     """
+    min_overlap_size = 2000
+    min_matching_bp = 100
+    min_coverage = 3
+    min_size_tip = 4
+    fuzz = 10
+    d = 50000  # Something with the bubbles
+
+    # Create graph from pafs
+    pafs = read_paf_file(paf_file)
+    cleaned_pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
+    genome_graph = create_genome_graph(cleaned_pafs, min_coverage)
+
+    # Graph cleaning
+    genome_graph = remove_transitive_edges(genome_graph, fuzz)
+    genome_graph = remove_small_tips(genome_graph, min_size_tip)
+    genome_graph = popping_bubbles(genome_graph, d)
+
+    # Convert to gfa format
+    print_gfa_file(genome_graph, read_file, output_gfa_file)
 
 
 if __name__ == "__main__":

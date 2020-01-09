@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from functools import partial
 from itertools import groupby, islice, repeat, tee
 from operator import itemgetter
-from typing import Callable, Dict, Iterable, Iterator, List, Set, Tuple
+from typing import IO, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 ###########
 # MINIMAP #
@@ -265,8 +265,7 @@ def map_query(
             else:
                 A.append((t, 1, i + i_t, i_t))
 
-    # Python automatically sorts by first looking at the first value of the tuple,
-    # than the second, than the third, etc.
+    # Python automatically sorts tuples with radix sort, which we want here.
     A.sort()
 
     b = 0
@@ -389,11 +388,29 @@ def minimap(target_seq_file_name, query_seq_file_name, output_file_name):
 ###########
 
 
-def read_paf_file(paf_file):
+# For PAF we will use fields 1-11. So not using the quality one, and optional additional
+PAF = Tuple[str, int, int, int, str, str, int, int, int, int, int]
+
+# A Mapping is described by two strings: The names of the query and the target,
+# and one more string to describe if they match on the same strand or opposite
+# (Just like in PAF.)
+All_Mappings = Dict[Tuple[str, str, str], List[Tuple[int, int, int, int]]]
+Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
+
+# In the genome graph each strand is described with the name and a bool
+# to indicate if True, it is the same strand, or False, it is the opposite.
+# (This is equivalent to {True: '+', '-': False} compared with PAF.)
+# The other two integers indicate the From start coord and the To end coord
+# of the mapping.
+Genome_Graph = Dict[Tuple[str, bool], Tuple[str, bool, int, int]]
+
+
+def read_paf_file(paf_file: IO) -> Iterator[PAF]:
     """
     Just read the file and yields each line as a paf tuple.
 
-    Return PAF tuple
+    The PAF file is tab delimited file with the fields:
+
     1	string	Query sequence name
     2	int	Query sequence length
     3	int	Query start coordinate (0-based)
@@ -401,14 +418,40 @@ def read_paf_file(paf_file):
     5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
     6	string	Target sequence name
     7	int	Target sequence length
+    8	int	Target start coordinate on the original strand
     9	int	Target end coordinate on the original strand
     10	int	Number of matching bases in the mapping
     11	int	Number bases, including gaps, in the mapping
     12	int	Mapping quality (0-255 with 255 for missing)
+
+    Parameters
+    ----------
+    paf_file : IO
+        IO readable object with the paf file.
+
+    Returns
+    -------
+    paf : tuple
+        Returns the PAF tuple, but without quality and additional fields.
     """
     for paf_line in paf_file:
-        paf_tuple = paf_line.strip().split("\t")
-        yield paf_tuple[:11]  # discard mapping quality, and additional fields.
+        p = paf_line.strip().split("\t")
+        # Convert the rigth fields to integer, and
+        # discard mapping quality, and additional fields after that.
+        paf_tuple = (
+            p[0],
+            int(p[1]),
+            int(p[2]),
+            int(p[3]),  # Query
+            p[4],  # Orientation
+            p[5],
+            int(p[6]),
+            int(p[7]),
+            int(p[8]),  # Target
+            int(p[9]),
+            int(p[10]),  # Mapping info
+        )
+        yield paf_tuple
 
 
 def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
@@ -425,11 +468,9 @@ def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
     return filter(lambda p: p[9] > min_matching_bp and p[10] > min_overlap_size, pafs)
 
 
-Mappings = Dict[Tuple[str, str, str], List[Tuple[int, int, int, int]]]
-Trimmed_Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
-
-
-def filter_overlaps(pafs, min_coverage):
+def filter_overlaps_and_create_seq_lens(
+    pafs: Iterable[PAF], min_coverage: int
+) -> Tuple[Mappings, Dict[str, int]]:
     """
     Step 2.1
 
@@ -437,28 +478,52 @@ def filter_overlaps(pafs, min_coverage):
     have the minimum coverage. It will also trim the mapping outside the
     region with not enough coverage.
 
+    This function will also make the sequence lengths dictionary.
+
     Returns
     ------
-    overhangs : dict
-        The overhangs are a dictionary with as a key the query->target mapping
-        with strand char and as a value a list with tuples
+    overhangs : Tuple[dict, dict]
+        The first value in the tuple is the overhangs, which is a dictionary
+        with as a key the query->target mapping with strand char
+        and as a value a list with tuples
         with qstart, qend, tstart, tend.
+
+        The second tuple is the sequence dictionary which maps the sequence name to
+        its length.
     """
-    mappings: Mappings = defaultdict(list)
+    mappings: All_Mappings = defaultdict(list)
+    seq_lens: Dict[str, int] = dict()
     for p in pafs:
         mappings[p[0], p[5], p[4]].append((p[2], p[3], p[7], p[8]))
+        seq_lens[p[0]] = p[1]
 
-    trimmed_mappings: Trimmed_Mappings = dict()
-    for key, mappings_list in mappings.items():
-        mapping = trim_overhang(mappings_list, min_coverage)
-        if mappings:  # Function returns None if not enough coverage.
-            trimmed_mappings[key] = mapping
+    # trim_mapping function will trim the mapping based on the list of mappings
+    # and the min_coverage.
+    trimmed_mappings_iter = (
+        (key, trim_mapping(mappings_list, min_coverage))
+        for key, mappings_list in mappings.items()
+    )
+    # The trim_mapping function will return None if there is no mapping with
+    # the min_coverage. This is filtered out here.
+    trimmed_mappings: Mappings = {
+        key: trimmed for key, trimmed in trimmed_mappings_iter if trimmed
+    }
+    return trimmed_mappings, seq_lens
 
 
-def trim_overhang(mapping_list, min_coverage):
+def trim_mapping(mapping_list, min_coverage) -> Optional[Tuple[int, int, int, int]]:
     """
-    Trim the mappings where the min_coverage is not achieved. If there will
-    be no mapping left after trimming return None.
+    Trim the mappings where the min_coverage is not achieved.
+
+    This function will calculate the mapping for each strand (query and target)
+    separately. (They can differ slightly.)
+
+    Returns
+    -------
+    mapping : Tuple[int, int, int, int]
+        The mapping with query start and end, and target start and end.
+
+    If there will be no mapping left after trimming return None.
     """
     q_map_strand = map_on_strand(((m[0], m[1]) for m in mapping_list), min_coverage)
     t_map_strand = map_on_strand(((m[2], m[3]) for m in mapping_list), min_coverage)
@@ -469,7 +534,7 @@ def trim_overhang(mapping_list, min_coverage):
         return None
 
 
-def map_on_strand(coords, min_coverage):
+def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
     """
     Trim the coordinates for minimum coverage.
 
@@ -480,9 +545,9 @@ def map_on_strand(coords, min_coverage):
     priority queue is equal to the coverage.
     """
     # Use heapq as a min heap to use as a priority qeueu
-    end_coords = []
-    trimmed_range_start = []
-    trimmed_range_end = []
+    end_coords: List[int] = []
+    trimmed_range_start: List[int] = []
+    trimmed_range_end: List[int] = []
     in_range = False
     for b, e in sorted(coords, key=itemgetter(0)):
 
@@ -508,23 +573,46 @@ def map_on_strand(coords, min_coverage):
                 in_range = True
 
     # Now return the maximum range with min_coverage
-    return max(zip(trimmed_range_start, trimmed_range_end), key=lambda c: c[1] - c[0])
+    if trimmed_range_start:
+        return max(
+            zip(trimmed_range_start, trimmed_range_end), key=lambda c: c[1] - c[0]
+        )
+    else:
+        return None
 
 
-def classify_overlap(overhangs, max_overhang, max_overhang_ratio):
+def create_genome_graph(
+    mappings: Mappings,
+    seq_lens: Dict[str, int],
+    max_overhang: int,
+    max_overhang_ratio: float,
+) -> Genome_Graph:
     """
     Step 2.2; Algorithm 5
 
     This function finds the overlaps with the correct characteristics.
+
+    With all the overlaps with the correct characteristics a new dictionary
+    is created which represents the genome graph.
+
+    Returns
+    -------
+    genome_graph : Genome_Graph
+        Returns a dictionary that represents the genome graph.
     """
-    pass
+    genome_graph: Genome_Graph = dict()
+    for (query, target, ori), (qstart, qend, tstart, tend) in mappings.items():
+        # We only add one edge per mapping as we assume the PAF file is already
+        # symmetric. (I.e. it contains all-vs-all mappings where all reads can be
+        # found in both the target role as the query role.)
+
+        # First we change the situation to the 'normal' one, where we look
+        # to the same site of both strands.
+        if ori == "-":
+            tlen = seq_lens[target]
+            tstart, tend = tlen - tend, tlen - tstart
 
 
-def create_genome_graph(overhangs):
-    """
-    Step 2.2
-    """
-    pass
 
 
 # Graph cleaning functions.
@@ -584,17 +672,17 @@ def miniasm(paf_file_name, reads_file_name, output_gfa):
     fuzz = 10
     d = 50000  # Something with the bubbles
 
-    # Create graph from pafs
+    # Create graph from pafs (2.1)
     with open(paf_file_name) as paf_file:
         pafs = read_paf_file(paf_file)
 
-        # 2.1
         pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
-        mappings = filter_overlaps(pafs, min_coverage)
+        mappings, seq_lens = filter_overlaps_and_create_seq_lens(pafs, min_coverage)
 
     # 2.2
-    overhangs = classify_overlap(mappings, max_overhang, max_overhang_ratio)
-    genome_graph = create_genome_graph(overhangs)
+    genome_graph = create_genome_graph(
+        mappings, seq_lens, max_overhang, max_overhang_ratio
+    )
 
     # Graph cleaning (2.3)
     genome_graph = remove_transitive_edges(genome_graph, fuzz)

@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Minimap and miniasm.
+Minimap and miniasm in Python.
+
+Requirements
+------------
+For this program the minimum is Python version 3.6.
+
+README
+------
+This program consists of two subprograms, minimap, and miniasm.
+
+You can run one or the other using the first argument, followed by the other
+arguments.
+
+For example:
+python3 $this_file_name.py minimap query.fq target.fq > output.paf
+
+For more details, you can use the --help flag to one the subprograms:
+python3 $this_file_name.py miniasm --help
 """
 
+import argparse
 import heapq
 import sys
 from collections import defaultdict, deque
@@ -246,15 +264,12 @@ def map_query(
     query_name: str,
     target_seq_info: Seq_Info,
     H: Target_Index,
-    minimizer_sketch: Minimizer_Sketch,
-    epsilon: int,
-    min_subset: int,
-    min_overlap: int,
+    args: argparse.Namespace,
 ):
     """
     Algorithm 4.
     """
-    M = minimizer_sketch(query_seq)
+    M = args.minimizer_sketch(query_seq)
     A = []
 
     # Collect minimizers hit
@@ -274,20 +289,21 @@ def map_query(
             e + 1 == len(A)
             or A[e + 1][0] != A[e][0]
             or A[e + 1][1] != A[e][1]
-            or A[e + 1][2] - A[e][2] >= e
+            or A[e + 1][2] - A[e][2] >= args.epsilon
         ):
             potential_overlap = A[b:e]
             b = e + 1
 
             begin, end = maximal_colinear_subset(map(itemgetter(3), potential_overlap))
 
-            if end - begin < min_subset:
+            if end - begin < args.min_subset:
                 continue
 
             res = overlap_hit(potential_overlap[begin:end])
-            if res[10] > min_overlap:
+            if res[10] > args.min_overlap:
                 res[0] = query_name
                 res[1] = len(query_seq)
+                # TODO
                 yield res
 
 
@@ -322,13 +338,13 @@ def maximal_colinear_subset(li: Iterable[int]) -> Tuple[int, int]:
     pass
 
 
-def read_fastx(file: str, format: str) -> Iterator[Tuple[str, str]]:
+def read_fastx(file: IO, format: str) -> Iterator[Tuple[str, str]]:
     """
     Currently, this function just assumes for fasta that the sequences and the
     fasta header are on alternating lines.
 
     Parameters
-    file : str
+    file : IO
         Name of the input file.
     format : str
         The format ("fasta" or "fastq")
@@ -343,45 +359,28 @@ def read_fastx(file: str, format: str) -> Iterator[Tuple[str, str]]:
     elif format == "fasta":
         group_size = 2
 
-    with open(file) as f:
-        ind_line = enumerate(f)
-        for ind, line in ind_line:
-            if ind % group_size == 0:
-                seq_name = line.strip()
-                _, seq = next(ind_line)[1].strip()
-                yield seq_name, seq
+    ind_line = enumerate(file)
+    for ind, line in ind_line:
+        if ind % group_size == 0:
+            seq_name = line.strip()
+            _, seq = next(ind_line)[1].strip()
+            yield seq_name, seq
 
 
-def minimap(target_seq_file_name, query_seq_file_name, output_file_name):
+def minimap(target_file: IO, query_file: IO, output_file: IO, args: argparse.Namespace):
     """
     This is the minimap function
     """
-    target_seqs = read_fastx(target_seq_file_name, format="fastq")
-    query_seqs = read_fastx(query_seq_file_name, format="fastq")
+    target_seqs = read_fastx(target_file, format="fastq")
+    query_seqs = read_fastx(query_file, format="fastq")
 
-    k = 6
-    w = 6
-    epsilon = 500
-    min_subset = 4
-    min_overlap = 100
+    args.minimizer_sketch = get_func_minimizer_sketch(args.w, args.k)
 
-    minimizer_sketch = get_func_minimizer_sketch(w, k)
+    H, target_seq_info = index_targets(target_seqs, args.minimizer_sketch)
 
-    H, target_seq_info = index_targets(target_seqs, minimizer_sketch)
-
-    with open(output_file_name, "w") if output_file_name else sys.stdout as out:
-        for query_name, query_seq in query_seqs:
-            for t in map_query(
-                query_seq,
-                query_name,
-                target_seq_info,
-                H,
-                minimizer_sketch,
-                epsilon,
-                min_subset,
-                min_overlap,
-            ):
-                print(*t, seq="\t", file=out)
+    for query_name, query_seq in query_seqs:
+        for t in map_query(query_seq, query_name, target_seq_info, H, args):
+            print(*t, sep="\t", file=output_file)
 
 
 ###########
@@ -390,7 +389,8 @@ def minimap(target_seq_file_name, query_seq_file_name, output_file_name):
 
 
 # For PAF we will use fields 1-11. So not using the quality one, and optional additional
-PAF = Tuple[str, int, int, int, str, str, int, int, int, int, int]
+Strand_Range = Tuple[str, int, int, int]
+PAF = Tuple[Strand_Range, str, Strand_Range, Tuple[int, int]]
 
 # A Mapping is described by two strings: The names of the query and the target,
 # and one more string to describe if they match on the same strand or opposite
@@ -441,19 +441,11 @@ def read_paf_file(paf_file: IO) -> Iterator[PAF]:
         p = paf_line.strip().split("\t")
         # Convert the rigth fields to integer, and
         # discard mapping quality, and additional fields after that.
-        paf_tuple = (
-            p[0],
-            int(p[1]),
-            int(p[2]),
-            int(p[3]),  # Query
-            p[4],  # Orientation
-            p[5],
-            int(p[6]),
-            int(p[7]),
-            int(p[8]),  # Target
-            int(p[9]),
-            int(p[10]),  # Mapping info
-        )
+        query = p[0], int(p[1]), int(p[2]), int(p[3])
+        orientation = str(p[4])
+        target = p[5], int(p[6]), int(p[7]), int(p[8])
+        mapping_info = int(p[9]), int(p[10])
+        paf_tuple = query, orientation, target, mapping_info
         yield paf_tuple
 
 
@@ -468,7 +460,9 @@ def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
     -------
     pafs
     """
-    return filter(lambda p: p[9] > min_matching_bp and p[10] > min_overlap_size, pafs)
+    return filter(
+        lambda p: p[3][0] > min_matching_bp and p[3][1] > min_overlap_size, pafs
+    )
 
 
 def filter_overlaps_and_create_seq_lens(
@@ -496,9 +490,12 @@ def filter_overlaps_and_create_seq_lens(
     """
     mappings: All_Mappings = defaultdict(list)
     seq_lens: Dict[str, int] = dict()
-    for p in pafs:
-        mappings[p[0], p[5], p[4]].append((p[2], p[3], p[7], p[8]))
-        seq_lens[p[0]] = p[1]
+
+    for query, orientation, target, mapping_info in pafs:
+        mappings[query[0], target[0], orientation].append(
+            (query[2], query[3], target[2], target[3])
+        )
+        seq_lens[query[0]] = query[1]
 
     # trim_mapping function will trim the mapping based on the list of mappings
     # and the min_coverage.
@@ -506,6 +503,7 @@ def filter_overlaps_and_create_seq_lens(
         (key, trim_mapping(mappings_list, min_coverage))
         for key, mappings_list in mappings.items()
     )
+
     # The trim_mapping function will return None if there is no mapping with
     # the min_coverage. This is filtered out here.
     trimmed_mappings: Mappings = {
@@ -531,10 +529,9 @@ def trim_mapping(mapping_list, min_coverage) -> Optional[Tuple[int, int, int, in
     q_map_strand = map_on_strand(((m[0], m[1]) for m in mapping_list), min_coverage)
     t_map_strand = map_on_strand(((m[2], m[3]) for m in mapping_list), min_coverage)
 
-    if q_map_strand and t_map_strand:
-        return (*q_map_strand, *t_map_strand)
-    else:
-        return None
+    # Only return the mapping if both have enough coverage.
+    # Checking both will ensure symmetry as well.
+    return (*q_map_strand, *t_map_strand) if q_map_strand and t_map_strand else None
 
 
 def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
@@ -803,54 +800,140 @@ def print_gfa_file(genome_graph, read_file, output_gfa_file):
     pass
 
 
-def miniasm(paf_file_name, reads_file_name, output_gfa):
+def miniasm(paf_file: IO, reads_file: IO, out: IO, args: argparse.Namespace):
     """
     This is the miniasm function.
     """
-    # Overlap classification parameters
-    min_overlap_size = 2000
-    min_matching_bp = 100
-    max_overhang = 1000
-    max_overhang_ratio = 0.8
-    min_coverage = 3
-
-    # Graph cleaning paramaters
-    min_size_tip = 4
-    fuzz = 10
-    probe_distance = 50000  # How far to venture to find bubbles.
-
     # First read the PAF file and filter the pafs (2.1).
-    with open(paf_file_name) as paf_file:
-        pafs = read_paf_file(paf_file)
+    pafs = read_paf_file(paf_file)
 
-        pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
-        mappings, seq_lens = filter_overlaps_and_create_seq_lens(pafs, min_coverage)
+    pafs = clean_small_overlaps(pafs, args.min_overlap_size, args.min_matching_bp)
+    mappings, seq_lens = filter_overlaps_and_create_seq_lens(pafs, args.min_coverage)
 
     # Create graph from pafs (2.2).
     genome_graph = create_genome_graph(
-        mappings, seq_lens, max_overhang, max_overhang_ratio
+        mappings, seq_lens, args.max_overhang, args.max_overhang_ratio
     )
 
     # Graph cleaning (2.3).
-    genome_graph = remove_transitive_edges(genome_graph, fuzz)
+    genome_graph = remove_transitive_edges(genome_graph, args.fuzz)
 
     # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
-    vertices = list(genome_graph.keys)
+    vertices = list(genome_graph.keys())
+
     for v in vertices:
-        remove_small_tip(genome_graph, min_size_tip, v)
+        remove_small_tip(genome_graph, args.min_size_tip, v)
+
     for start in vertices:
-        pop_bubble(genome_graph, seq_lens, probe_distance, start)
+        pop_bubble(genome_graph, seq_lens, args.probe_distance, start)
 
     unitig_genome_graph, unitig_to_reads = create_unitigs(genome_graph)
 
     # Convert to gfa format
 
-    with open(reads_file_name) as reads_file:
-        read_seqs = dict(read_fastx(reads_file, "fastq"))
+    read_seqs = dict(read_fastx(reads_file, "fastq"))
 
-    with open(output_gfa, "w") if output_gfa else sys.stdout as out:
-        print_gfa_file(unitig_genome_graph, read_seqs, out)
+    print_gfa_file(unitig_genome_graph, read_seqs, out)
 
 
 if __name__ == "__main__":
-    print("hi")
+    parser = argparse.ArgumentParser(prog="MINIMAP-MINIASM")
+
+    # The '-' for files types indicates stdin or stdout.
+    parser.add_argument("--out", type=argparse.FileType("w"), default="-")
+
+    subparsers = parser.add_subparsers(help="MINIMAP-MINIASM")
+
+    # minimap argument parsing
+    minimap_argparser = subparsers.add_parser("minimap", help="Map sequences.")
+    minimap_argparser.add_argument("target", type=argparse.FileType("r"))
+    minimap_argparser.add_argument("query", type=argparse.FileType("r"))
+
+    indexing = minimap_argparser.add_argument_group("Indexing options")
+    indexing.add_argument("-k", help="minimizer length", default=15)
+    indexing.add_argument("-w", help="minimizer window size (default is 2/3 of k).")
+
+    mapping = minimap_argparser.add_argument_group("Mapping options")
+    mapping.add_argument(
+        "-n",
+        "--min-subset",
+        help="Minimum minimizers in mappings",
+        default=4,
+        type=int,
+    )
+    mapping.add_argument(
+        "-r",
+        "--epsilon",
+        help="Maximum gap size between minimizers.",
+        default=500,
+        type=int,
+    )
+    mapping.add_argument(
+        "-L",
+        "--min-overlap",
+        help="Minimum overlap of a mapping",
+        default=100,
+        type=int,
+    )
+
+    # miniasm argument parsing
+    miniasm_argparser = subparsers.add_parser("miniasm", help="Assembly from PAF file.")
+    miniasm_argparser.add_argument("paf", type=argparse.FileType("r"))
+
+    preselection = miniasm_argparser.add_argument_group("Preselection options")
+    preselection.add_argument(
+        "-m",
+        "--min-matching-bp",
+        default=100,
+        type=int,
+        help="Drop mappings having less mapped bp than min-matching-bp.",
+    )
+    preselection.add_argument(
+        "-s",
+        "--min-overlap-size",
+        default=1000,
+        type=int,
+        help="Drop mappings that are shorter than min-overlap-size.",
+    )
+
+    overlapping = miniasm_argparser.add_argument_group("Overlapping options")
+    overlapping.add_argument(
+        "-h", "--max-overhang", help="Maximum overhang length", default=1000, type=int
+    )
+    overlapping.add_argument(
+        "-I",
+        "--max-overhang-ration",
+        help="Maximum overhang ration.",
+        default=0.8,
+        type=float,
+    )
+
+    graph = miniasm_argparser.add_argument_group("Graph layout options")
+    graph.add_argument(
+        "-n", "--min-coverage", help="Minimum coverage of overlap", default=3, type=int
+    )
+    graph.add_argument(
+        "-e", "--min-size-tip", help="The minimum size of a tip", default=4, type=int
+    )
+    graph.add_argument("-f", "--reads", type=argparse.FileType("r"), required=True)
+    graph.add_argument(
+        "-d",
+        "--probe-distance",
+        help="Maximum probe distance for bubble popping.",
+        default=50000,
+        type=int,
+    )
+
+    subprograms = {"minimap", "miniasm"}
+    if sys.argv[1] not in subprograms:
+        print(f"You did not select a correct sub program: {subprograms}")
+        sys.exit(1)
+
+    args = parser.parse_args()
+    if sys.argv[1] == "minimap":
+        if not args.w:
+            args.w = int(2 * args.k / 3)  # Default is 2 / 3 of k.
+        minimap(args.target, args.query, args.out, args)
+    elif sys.argv[1] == "miniasm":
+        args.fuzz = 10  # Used by the removal of transitive edges
+        miniasm(args.paf, args.reads, args.out, args)

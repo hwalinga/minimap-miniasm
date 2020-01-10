@@ -301,6 +301,7 @@ def overlap_hit(minimizer_hits: List[Tuple[int, int, int, int]]):
     5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
     6	string	Target sequence name
     7	int	Target sequence length
+    8	int	Target start coordinate on the original strand
     9	int	Target end coordinate on the original strand
     10	int	Number of matching bases in the mapping
     11	int	Number bases, including gaps, in the mapping
@@ -398,11 +399,13 @@ All_Mappings = Dict[Tuple[str, str, str], List[Tuple[int, int, int, int]]]
 Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
 
 # In the genome graph each strand is described with the name and a bool
-# to indicate if True, it is the same strand, or False, it is the opposite.
+# to indicate strand side. If True, it is the same strand,
+# if False, it is the opposite.
 # (This is equivalent to {True: '+', '-': False} compared with PAF.)
-# The other two integers indicate the From start coord and the To end coord
-# of the mapping.
-Genome_Graph = Dict[Tuple[str, bool], Tuple[str, bool, int, int]]
+# The other integer indicates the lenght of the mapping.
+# The key value pairs indicate from-to mapping.
+Vertex = Tuple[str, bool]
+Genome_Graph = Dict[Vertex, List[Tuple[Vertex, int]]]
 
 
 def read_paf_file(paf_file: IO) -> Iterator[PAF]:
@@ -595,24 +598,70 @@ def create_genome_graph(
     With all the overlaps with the correct characteristics a new dictionary
     is created which represents the genome graph.
 
+    Parameters
+    ----------
+    mappings : Mappings
+        A dictionary with all the mappings.
+    seq_lens : Dict[str, int]
+        A dictionary that maps the sequence name to the lenght of the sequence.
+    max_overhang : int
+        The maximum size the overhangs of the mappings can be to still be a
+        viable mapping for the genome graph.
+    max_overhang_ratio : float
+        The maximum ratio between the overhang and the mapping length for
+        the mapping to still be a viable candidate for the genome graph.
+
     Returns
     -------
     genome_graph : Genome_Graph
         Returns a dictionary that represents the genome graph.
     """
-    genome_graph: Genome_Graph = dict()
+    genome_graph: Genome_Graph = defaultdict(list)
     for (query, target, ori), (qstart, qend, tstart, tend) in mappings.items():
-        # We only add one edge per mapping as we assume the PAF file is already
+        # We only add one edge per mapping
+        # as we assume the PAF file is already
         # symmetric. (I.e. it contains all-vs-all mappings where all reads can be
-        # found in both the target role as the query role.)
+        # found in both the target role as well as the query role.)
+
+        qlen = seq_lens[query]
+        tlen = seq_lens[target]
 
         # First we change the situation to the 'normal' one, where we look
         # to the same site of both strands.
         if ori == "-":
-            tlen = seq_lens[target]
             tstart, tend = tlen - tend, tlen - tstart
 
+        overhang = min(qstart, tstart) + min(qlen - qend, tlen - tend)
+        maplen = max(qend - qstart, tend - tstart)
 
+        if overhang > min(max_overhang, max_overhang_ratio * maplen):
+            # Internal match
+            continue
+        elif qstart <= tstart and qlen - qend <= tlen - tend:
+            # Query contained
+            continue
+        elif qstart >= tstart and qlen - qend >= tlen - tend:
+            # Target contained
+            continue
+        elif qstart > tstart:
+            # Query to target
+            target_ori = ori != "-"  # False if on opposite strands.
+            genome_graph[query, True].append(((target, target_ori), maplen))
+        else:
+            # Target to query
+            # For the symmetry we only add query to target mappings.
+            # For this target to query mapping, we just swap the strand side
+            # and add query complement strand to target complement strand.
+            # (NB. The target to query mapping will be added with another
+            # mapping that swaps this roles. Provided the PAF is symmetrical.)
+
+            # To change target-to-query mapping, to query-to-target mapping,
+            # we swap strands. If mapping is on opposite strand, target is
+            # on the same strand again.
+            target_ori = ori == "-"
+            genome_graph[query, False].append(((target, target_ori), maplen))
+
+    return genome_graph
 
 
 # Graph cleaning functions.
@@ -629,14 +678,112 @@ def remove_small_tips(genome_graph, min_size_tip):
     """
     ...
     """
-    pass
+    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
+    for v in list(genome_graph.keys()):
+        remove_small_tip(genome_graph, min_size_tip, v)
 
 
-def popping_bubbles(genome_graph, min_size_tip):
+def remove_small_tip(genome_graph, min_size_tip, v):
+    # We find the tip of the tip of edges,
+    # by inspecting if the symmetry vertex does not contain edges.
+    if genome_graph[v[0], not v[1]]:
+        return
+
+    # This is a tip, see if it is small.
+
+    # Follow incoming edges and see if we hit a junction within min_size_tip.
+    tip_consists = []
+    for _ in repeat(None, min_size_tip):
+        # We check if there are more than one edges in the vertex and its complement.
+        # If there is more than one in one of them, this is a junction,
+        # not part of the tip.
+        if len(genome_graph[v]) > 1 or len(genome_graph[v[0], not v[1]]) > 1:
+            # Junction: remove tip and return
+            for w in tip_consists:
+                del genome_graph[w]
+                del genome_graph[w[0], not v[1]]
+            return
+        tip_consists.append(v)
+        v = genome_graph[v][0][0]
+
+    # Moved over edges and no junction, so this is a long tip.
+    return
+
+
+def popping_bubbles(
+    genome_graph: Genome_Graph, seq_lens: Dict[str, int], probe_distance: int
+) -> None:
     """
-    ...
+    Popping small bubbles from the genome_graph.
+
+    Algorithm 6.
     """
-    pass
+    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
+    for start in list(genome_graph.keys()):
+        pop_bubble(genome_graph, seq_lens, probe_distance, start)
+
+
+def pop_bubble(
+    genome_graph: Genome_Graph,
+    seq_lens: Dict[str, int],
+    probe_distance: int,
+    start: Vertex,
+) -> None:
+    if len(genome_graph[start]) < 2:  # Cannot be the source of a bubble.
+        return
+
+    # Keep track of a path through the bubble, and all other vertices
+    bubble_path = {start}
+    path_tip = start
+    other_vertices = set()
+
+    # Keeping track of things to find the bubble.
+    unvisited_incoming = dict()
+    distances = dict.fromkeys(genome_graph.keys(), sys.maxsize)
+    distances[start] = 0
+    S = [start]
+    p = 0  # Number of visited vertices not yet in S.
+
+    while S:
+        v = S.pop()
+        first = True
+        for w, maplen in genome_graph[v]:
+            if path_tip == v and first:
+                # We keep track of a path by checking if the current vertex
+                # is in the last in the path and appending the first next vertex.
+                bubble_path.add(w)
+                path_tip = w
+                first = False
+            elif w not in bubble_path:
+                other_vertices.add(w)
+
+            if w == start:  # A circle is not a bubble.
+                return
+
+            new_dist = distances[v] + seq_lens[v[0]] - maplen
+            if new_dist > probe_distance:  # Too far away
+                return
+
+            if distances[w] == sys.maxsize:  # Not visited
+                # We make use of the symmetry to find the incoming edges.
+                unvisited_incoming[w] = len(genome_graph[w[0], not [1]])
+                p += 1
+            elif new_dist < distances[w]:
+                distances[w] = new_dist
+
+            unvisited_incoming[w] -= 1
+            if unvisited_incoming[w] == 0:  # We have visisted all incoming edges.
+                if genome_graph[w]:  # Not a tip
+                    S.append(w)
+                p -= 1
+
+        if len(S) == 1 and p == 0:  # This is the sink.
+            # Now remove all vertices that are part of the bubble, but not the path.
+            # As a bonus we remove the other side as well.
+            for v in other_vertices:
+                del genome_graph[v]
+                del genome_graph[v[0], not v[1]]
+            return
 
 
 def create_unitigs(genome_graph):
@@ -658,7 +805,7 @@ def print_gfa_file(genome_graph, read_file, output_gfa_file):
 
 def miniasm(paf_file_name, reads_file_name, output_gfa):
     """
-    This is the miniasm function
+    This is the miniasm function.
     """
     # Overlap classification parameters
     min_overlap_size = 2000
@@ -670,31 +817,39 @@ def miniasm(paf_file_name, reads_file_name, output_gfa):
     # Graph cleaning paramaters
     min_size_tip = 4
     fuzz = 10
-    d = 50000  # Something with the bubbles
+    probe_distance = 50000  # How far to venture to find bubbles.
 
-    # Create graph from pafs (2.1)
+    # First read the PAF file and filter the pafs (2.1).
     with open(paf_file_name) as paf_file:
         pafs = read_paf_file(paf_file)
 
         pafs = clean_small_overlaps(pafs, min_overlap_size, min_matching_bp)
         mappings, seq_lens = filter_overlaps_and_create_seq_lens(pafs, min_coverage)
 
-    # 2.2
+    # Create graph from pafs (2.2).
     genome_graph = create_genome_graph(
         mappings, seq_lens, max_overhang, max_overhang_ratio
     )
 
-    # Graph cleaning (2.3)
+    # Graph cleaning (2.3).
     genome_graph = remove_transitive_edges(genome_graph, fuzz)
-    genome_graph = remove_small_tips(genome_graph, min_size_tip)
-    genome_graph = popping_bubbles(genome_graph, d)
-    unitig_genome_graph = create_unitigs(genome_graph)
+
+    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
+    vertices = list(genome_graph.keys)
+    for v in vertices:
+        remove_small_tip(genome_graph, min_size_tip, v)
+    for start in vertices:
+        pop_bubble(genome_graph, seq_lens, probe_distance, start)
+
+    unitig_genome_graph, unitig_to_reads = create_unitigs(genome_graph)
 
     # Convert to gfa format
+
     with open(reads_file_name) as reads_file:
-        read_seqs = read_fastx(reads_file, "fastq")
-        with open(output_gfa, "w") if output_gfa else sys.stdout as out:
-            print_gfa_file(unitig_genome_graph, read_seqs, out)
+        read_seqs = dict(read_fastx(reads_file, "fastq"))
+
+    with open(output_gfa, "w") if output_gfa else sys.stdout as out:
+        print_gfa_file(unitig_genome_graph, read_seqs, out)
 
 
 if __name__ == "__main__":

@@ -19,11 +19,17 @@ python3 $this_file_name.py minimap query.fq target.fq > output.paf
 
 For more details, you can use the --help flag to one of the subprograms:
 python3 $this_file_name.py miniasm --help
+
+NB.
+
+There is also a third subprogram, which is the test subprogram. This will
+run the unittest included in this program.
 """
 
 import argparse
 import heapq
 import sys
+import unittest
 from collections import defaultdict, deque
 from functools import partial
 from itertools import chain, groupby, islice, repeat, tee
@@ -731,11 +737,60 @@ def create_genome_graph(
 # Graph cleaning functions.
 
 
-def remove_transitive_edges(genome_graph, fuzz):
+def remove_transitive_edges(
+    genome_graph: Genome_Graph, vertices: List[Vertex], seq_lens: Seq_Lens, fuzz: int
+) -> None:
     """
     Myers 2005
     """
-    pass
+
+    def edge_len(edge_info: Tuple[Vertex, int]) -> int:
+        vertex, maplen = edge_info
+        return seq_lens[vertex[0]] - maplen
+
+    for val in genome_graph.values():
+        # Sort all edges so that the longest
+        val.sort(key=edge_len, reverse=True)
+
+    # This dict has the following convention: {0: vacant, 1: inplay, 2: elimated}
+    vertices_dict: Dict[Vertex, int] = dict.fromkeys(vertices, 0)
+
+    for v in vertices:
+        for w, _ in genome_graph[v]:
+            vertices_dict[w] = 1
+
+        longest = edge_len(genome_graph[v][-1]) + fuzz
+
+        for w, maplen_w in genome_graph[v]:
+            if vertices_dict[w] != 1:
+                continue
+            v2w_len = edge_len((w, maplen_w))
+            first = True
+            for x, maplen_x in genome_graph[w]:
+
+                # Check the smallest edge of w.
+                if first and vertices_dict[x] == 1:
+                    vertices_dict[x] == 2  # eliminated
+                first = False
+
+                # Check all edges smaller than fuzz.
+                if edge_len((x, maplen_x)) < fuzz and vertices_dict[x] == 1:
+                    vertices_dict[x] == 2
+
+                # When edge too long, we don't have to check anymore
+                if v2w_len + edge_len((x, maplen_x)) > longest:
+                    break
+
+                if vertices_dict[x] == 1:
+                    vertices_dict[x] = 2  # eliminated
+
+        new_edges: List[Tuple[Vertex, int]] = []
+        for w, maplen in genome_graph[v]:
+            if vertices_dict[w] != 2:
+                new_edges.append((w, maplen))
+            vertices_dict[w] = 0
+
+        genome_graph[v] = new_edges
 
 
 def remove_small_tip(genome_graph, min_size_tip, v):
@@ -794,10 +849,11 @@ def pop_bubble(
     while S:
         v = S.pop()
         first = True
-        for w, maplen in genome_graph[v]:
+        for w, maplen in sorted(genome_graph[v], key=itemgetter(1), reverse=True):
             if path_tip == v and first:
                 # We keep track of a path by checking if the current vertex
                 # is in the last in the path and appending the first next vertex.
+                # The sorting puts the longest map length as the preferred path.
                 bubble_path.add(w)
                 path_tip = w
                 first = False
@@ -833,21 +889,98 @@ def pop_bubble(
             return
 
 
-def create_unitigs(genome_graph):
+def create_unitigs(
+    genome_graph: Genome_Graph, vertices: List[Vertex]
+) -> Dict[str, List[Tuple[Vertex, int]]]:
     """
     ...
     """
-    pass
+
+    def utg_to_name(utg_nr: int) -> str:
+        return f"{utg_nr:06}"
+
+    unitig_to_reads: Dict[str, List[Tuple[Vertex, int]]] = dict()
+    utg_nr = 1
+    converted_start: Dict[str, str] = dict()  # dict with start tip to converted utg
+
+    for start in vertices:
+        # First see if the start of the unitig goes one way.
+        if len(genome_graph[start]) != 1:
+            continue
+
+        # The start of a unitig must be a junction or a tip.
+        other_start = start[0], not start[1]  # Using symmetry vertex again
+        in_edges = len(genome_graph[other_start])
+        if in_edges == 1:
+            continue
+
+        # Continue till junction or tip
+        utg_path = [(start, 0)]
+        v = start
+        while len(genome_graph[v]) == 1:
+            del genome_graph[v]
+            v_info = genome_graph[v][0]
+            v = v_info[0]
+            utg_path.append(v_info)
+
+        end = v
+        utg_name = converted_start[end[0]]
+        if utg_name:
+            ori = False
+        else:
+            utg_name = utg_to_name(utg_nr)
+            utg_nr += 1
+            ori = True
+
+        unitig_to_reads[utg_name] = utg_path
+
+        incoming_edges = [(w[0], not w[1]) for w, _ in genome_graph[other_start]]
+        for w in incoming_edges:
+            genome_graph[w] = [
+                ((utg_name, ori) if x[0] == start else x, maplen)
+                for x, maplen in genome_graph[w]
+            ]
+
+        genome_graph[utg_name, ori] = genome_graph[end]
+        del genome_graph[end]
+
+    return unitig_to_reads
 
 
 # Print to file functions.
 
 
-def print_gfa_file(genome_graph, read_file, output_gfa_file):
+def print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out):
     """
     ...
     """
-    pass
+
+    def get_ori(ori: bool) -> str:
+        return "+" if ori else "-"
+
+    def gfa():
+        for name, ori in genome_graph.keys():
+            seq = read_seqs[name]
+            if seq:
+                yield "S", name, seq
+                continue
+
+            # It's a utg
+            utg_name = name
+            utg_path = iter(unitig_to_reads[utg_name])
+            name, ori = next(utg_path)[0]
+            new_seq = read_seqs[name] if ori else complement(read_seqs[name])
+            for (name, ori), maplen in utg_path:
+                add_seq = read_seqs[name] if ori else complement(read_seqs[name])
+                new_seq += add_seq[maplen:]
+            yield "S", utg_name, new_seq
+
+        for v, edges in genome_graph.items():
+            for (w, maplen) in edges:
+                yield "L", v[0], get_ori(v[1]), w[0], get_ori(w[1]), f"{maplen}M"
+
+    for line in gfa():
+        print(*line, sep="\t", file=out)
 
 
 def miniasm(paf_file: IO, reads_file: IO, out: IO, args: argparse.Namespace):
@@ -865,28 +998,42 @@ def miniasm(paf_file: IO, reads_file: IO, out: IO, args: argparse.Namespace):
         mappings, seq_lens, args.max_overhang, args.max_overhang_ratio
     )
 
-    # Graph cleaning (2.3).
-    genome_graph = remove_transitive_edges(genome_graph, args.fuzz)
-
-    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
     vertices = list(genome_graph.keys())
 
+    # Graph cleaning (2.3).
+    remove_transitive_edges(genome_graph, vertices, seq_lens, args.fuzz)
+
+    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
     for v in vertices:
         remove_small_tip(genome_graph, args.min_size_tip, v)
 
     for start in vertices:
         pop_bubble(genome_graph, seq_lens, args.probe_distance, start)
 
-    unitig_genome_graph, unitig_to_reads = create_unitigs(genome_graph)
+    unitig_to_reads = create_unitigs(genome_graph, vertices)
 
     # Convert to gfa format
 
     read_seqs = dict(read_fastx(reads_file, "fastq"))
 
-    print_gfa_file(unitig_genome_graph, read_seqs, out)
+    print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out)
+
+
+#########
+# Tests #
+#########
+
+
+class TestSuite(unittest.TestCase):
+    def test_hash(self):
+        pass
+
+    def test_seq_hash(self):
+        pass
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(prog="MINIMAP-MINIASM")
 
     # The '-' for files types indicates stdin or stdout.
@@ -974,16 +1121,21 @@ if __name__ == "__main__":
         type=int,
     )
 
-    subprograms = {"minimap", "miniasm"}
+    subparsers.add_parser("test", help="Run the unittests.")
+
+    subprograms = {"minimap", "miniasm", "test"}
     if sys.argv[1] not in subprograms:
         print(f"You did not select a correct sub program: {subprograms}")
         sys.exit(1)
 
-    args = parser.parse_args()
-    if sys.argv[1] == "minimap":
-        if not args.w:
-            args.w = int(2 * args.k / 3)  # Default is 2 / 3 of k.
-        minimap(args.target, args.query, args.out, args)
-    elif sys.argv[1] == "miniasm":
-        args.fuzz = 10  # Used by the removal of transitive edges
-        miniasm(args.paf, args.reads, args.out, args)
+    if sys.argv[1] == "test":
+        unittest.main()
+    else:
+        args = parser.parse_args()
+        if sys.argv[1] == "minimap":
+            if not args.w:
+                args.w = round(2 * args.k / 3)  # Default is 2 / 3 of k.
+            minimap(args.target, args.query, args.out, args)
+        elif sys.argv[1] == "miniasm":
+            args.fuzz = 10  # Used by the removal of transitive edges
+            miniasm(args.paf, args.reads, args.out, args)

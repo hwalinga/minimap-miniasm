@@ -17,7 +17,7 @@ arguments.
 For example:
 python3 $this_file_name.py minimap query.fq target.fq > output.paf
 
-For more details, you can use the --help flag to one the subprograms:
+For more details, you can use the --help flag to one of the subprograms:
 python3 $this_file_name.py miniasm --help
 """
 
@@ -26,7 +26,7 @@ import heapq
 import sys
 from collections import defaultdict, deque
 from functools import partial
-from itertools import groupby, islice, repeat, tee
+from itertools import chain, groupby, islice, repeat, tee
 from operator import itemgetter
 from typing import IO, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -50,10 +50,14 @@ Seq_Hash = Callable[[str], int]
 
 # A dictionary that maps the hash to a list of tuples with
 # target sequence id, position, and strand.
-Target_Index = Dict[int, List[Tuple[int, int, bool]]]
+Target_Index = Dict[int, List[Tuple[str, int, bool]]]
 
-# A list with a tuple with the name, and the lenght of the sequences.
-Seq_Info = List[Tuple[str, int]]
+# A dictionary that maps the sequence name to the length.
+Seq_Lens = Dict[str, int]
+
+# For PAF we will use fields 1-11. So not using the quality one, and optional additional
+Strand_Range = Tuple[str, int, int, int]
+PAF = Tuple[Strand_Range, str, Strand_Range, Tuple[int, int]]
 
 
 def reverse_complement(s: str) -> str:
@@ -235,19 +239,19 @@ def get_func_minimizer_sketch(w: int, k: int) -> Minimizer_Sketch:
 
 def index_targets(
     target_seqs: Iterable[Tuple[str, str]], minimizer_sketch: Minimizer_Sketch
-) -> Tuple[Target_Index, Seq_Info]:
+) -> Tuple[Target_Index, Seq_Lens]:
     """
     Algorithm 3.
     """
     H_list = []
-    seq_info = []
-    for t, (name, seq) in enumerate(target_seqs):
+    seq_lens: Seq_Lens = dict()
+    for name, seq in target_seqs:
 
-        seq_info.append((name, len(seq)))
+        seq_lens[name] = len(seq)
 
         M = minimizer_sketch(seq)
         for h, i, r in M:
-            H_list.append((h, (t, i, r)))
+            H_list.append((h, (name, i, r)))
 
     H_list.sort(key=itemgetter(0))
 
@@ -256,18 +260,40 @@ def index_targets(
         for h, vals in groupby(H_list, key=itemgetter(0))
     }
 
-    return H_dict, seq_info
+    return H_dict, seq_lens
 
 
 def map_query(
     query_seq: str,
-    query_name: str,
-    target_seq_info: Seq_Info,
+    qname: str,
+    target_seq_info: Seq_Lens,
     H: Target_Index,
     args: argparse.Namespace,
-):
+) -> Iterable[PAF]:
     """
+    Takes a query and maps it to the target indexers.
+
     Algorithm 4.
+
+    Returns
+    -------
+    paf_it : Iterable[PAF]
+        PAF tuple, this is a structured PAF line.
+
+    Notes
+    -----
+    1	string	Query sequence name
+    2	int	Query sequence length
+    3	int	Query start coordinate (0-based)
+    4	int	Query end coordinate (0-based)
+    5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
+    6	string	Target sequence name
+    7	int	Target sequence length
+    8	int	Target start coordinate on the original strand
+    9	int	Target end coordinate on the original strand
+    10	int	Number of matching bases in the mapping
+    11	int	Number bases, including gaps, in the mapping
+    12	int	Mapping quality (0-255 with 255 for missing)
     """
     M = args.minimizer_sketch(query_seq)
     A = []
@@ -294,48 +320,92 @@ def map_query(
             potential_overlap = A[b:e]
             b = e + 1
 
-            begin, end = maximal_colinear_subset(map(itemgetter(3), potential_overlap))
+            indices = maximum_colinear_subset(map(itemgetter(3), potential_overlap))
 
-            if end - begin < args.min_subset:
+            if len(indices) < args.min_subset:
+                # Not enough minimizers in this mapping. Do not use.
                 continue
 
-            res = overlap_hit(potential_overlap[begin:end])
-            if res[10] > args.min_overlap:
-                res[0] = query_name
-                res[1] = len(query_seq)
-                # TODO
-                yield res
+            bh = potential_overlap[indices[0]]
+            eh = potential_overlap[indices[-1]]
+            mapped_bp = len(indices) * args.k
+
+            qlen = len(query_seq)
+            tname = potential_overlap[0][0]
+            tlen = target_seq_info[tname]
+
+            orientation = "-" if bh[1] == 1 else "+"
+
+            # Undo the transformation, and find the exact coords of the ranges.
+            if orientation != "-":  # same strand
+                tstart, tend = bh[3], eh[3] + args.k
+                qstart, qend = bh[2] + bh[3], eh[2] + eh[3] + args.k
+            else:  # Opposite strand
+                tstart, tend = eh[3] - args.k, bh[3]
+                qstart, qend = bh[2] - bh[3], eh[2] - eh[3] + args.k
+
+            maplen = max(qend - qstart, tend - tstart)
+            if maplen < args.min_overlap:
+                # Mapping not large enough. Do not use.
+                continue
+
+            query = qname, qlen, qstart, qend
+            target = tname, tlen, tstart, tend
+            mapping_info = mapped_bp, maplen
+
+            paf = query, orientation, target, mapping_info
+
+            yield paf
 
 
-def overlap_hit(minimizer_hits: List[Tuple[int, int, int, int]]):
-    """
-    Return PAF tuple
-    1	string	Query sequence name
-    2	int	Query sequence length
-    3	int	Query start coordinate (0-based)
-    4	int	Query end coordinate (0-based)
-    5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
-    6	string	Target sequence name
-    7	int	Target sequence length
-    8	int	Target start coordinate on the original strand
-    9	int	Target end coordinate on the original strand
-    10	int	Number of matching bases in the mapping
-    11	int	Number bases, including gaps, in the mapping
-    12	int	Mapping quality (0-255 with 255 for missing)
-    """
-    pass
-
-
-def maximal_colinear_subset(li: Iterable[int]) -> Tuple[int, int]:
+def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
     """
     Find the longest increasing subsequence.
 
+    Source: https://stackoverflow.com/questions/3992697/longest-increasing-subsequence
+
     Returns
     -------
-    begin, end : Tuple[int, int]
-        Return the first index and the last index of the longest increasing subsequence.
+    indices : List[int]
+        Returns the indices of the longest increasing subsequence.
     """
-    pass
+    seq = list(seq)
+
+    P: List[Optional[int]] = [None]
+    M = [0]
+
+    for i in range(1, len(seq)):
+
+        # Binary search
+        lo = 0
+        up = len(M)
+
+        if seq[M[up - 1]] < seq[i]:
+            j = up
+            M.append(i)
+        else:
+            while up - lo > 1:
+                mid = (lo + up) // 2
+                if seq[M[up - 1]] < seq[i]:
+                    lo = mid
+                else:
+                    up = mid
+            j = lo
+
+            if seq[i] < seq[M[j]]:
+                M[j] = i
+
+        # Update P
+        P.append(M[j - 1])
+
+    # Trace back using the predecessor array (P).
+    def trace(i):
+        if i is not None:
+            yield from trace(P[i])
+            yield i
+
+    indices = list(trace(M[-1]))
+    return indices
 
 
 def read_fastx(file: IO, format: str) -> Iterator[Tuple[str, str]]:
@@ -380,17 +450,14 @@ def minimap(target_file: IO, query_file: IO, output_file: IO, args: argparse.Nam
 
     for query_name, query_seq in query_seqs:
         for t in map_query(query_seq, query_name, target_seq_info, H, args):
-            print(*t, sep="\t", file=output_file)
+            # We don't calculate quality, so we just print 255 there.
+            print(*chain(*t), 255, sep="\t", file=output_file)
 
 
 ###########
 # MINIASM #
 ###########
 
-
-# For PAF we will use fields 1-11. So not using the quality one, and optional additional
-Strand_Range = Tuple[str, int, int, int]
-PAF = Tuple[Strand_Range, str, Strand_Range, Tuple[int, int]]
 
 # A Mapping is described by two strings: The names of the query and the target,
 # and one more string to describe if they match on the same strand or opposite
@@ -445,8 +512,8 @@ def read_paf_file(paf_file: IO) -> Iterator[PAF]:
         orientation = str(p[4])
         target = p[5], int(p[6]), int(p[7]), int(p[8])
         mapping_info = int(p[9]), int(p[10])
-        paf_tuple = query, orientation, target, mapping_info
-        yield paf_tuple
+        paf = query, orientation, target, mapping_info
+        yield paf
 
 
 def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
@@ -467,7 +534,7 @@ def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
 
 def filter_overlaps_and_create_seq_lens(
     pafs: Iterable[PAF], min_coverage: int
-) -> Tuple[Mappings, Dict[str, int]]:
+) -> Tuple[Mappings, Seq_Lens]:
     """
     Step 2.1
 
@@ -489,7 +556,7 @@ def filter_overlaps_and_create_seq_lens(
         its length.
     """
     mappings: All_Mappings = defaultdict(list)
-    seq_lens: Dict[str, int] = dict()
+    seq_lens: Seq_Lens = dict()
 
     for query, orientation, target, mapping_info in pafs:
         mappings[query[0], target[0], orientation].append(
@@ -583,7 +650,7 @@ def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
 
 def create_genome_graph(
     mappings: Mappings,
-    seq_lens: Dict[str, int],
+    seq_lens: Seq_Lens,
     max_overhang: int,
     max_overhang_ratio: float,
 ) -> Genome_Graph:
@@ -599,7 +666,7 @@ def create_genome_graph(
     ----------
     mappings : Mappings
         A dictionary with all the mappings.
-    seq_lens : Dict[str, int]
+    seq_lens : Seq_Lens
         A dictionary that maps the sequence name to the lenght of the sequence.
     max_overhang : int
         The maximum size the overhangs of the mappings can be to still be a
@@ -671,16 +738,10 @@ def remove_transitive_edges(genome_graph, fuzz):
     pass
 
 
-def remove_small_tips(genome_graph, min_size_tip):
+def remove_small_tip(genome_graph, min_size_tip, v):
     """
     ...
     """
-    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
-    for v in list(genome_graph.keys()):
-        remove_small_tip(genome_graph, min_size_tip, v)
-
-
-def remove_small_tip(genome_graph, min_size_tip, v):
     # We find the tip of the tip of edges,
     # by inspecting if the symmetry vertex does not contain edges.
     if genome_graph[v[0], not v[1]]:
@@ -707,25 +768,14 @@ def remove_small_tip(genome_graph, min_size_tip, v):
     return
 
 
-def popping_bubbles(
-    genome_graph: Genome_Graph, seq_lens: Dict[str, int], probe_distance: int
+def pop_bubble(
+    genome_graph: Genome_Graph, seq_lens: Seq_Lens, probe_distance: int, start: Vertex,
 ) -> None:
     """
     Popping small bubbles from the genome_graph.
 
     Algorithm 6.
     """
-    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
-    for start in list(genome_graph.keys()):
-        pop_bubble(genome_graph, seq_lens, probe_distance, start)
-
-
-def pop_bubble(
-    genome_graph: Genome_Graph,
-    seq_lens: Dict[str, int],
-    probe_distance: int,
-    start: Vertex,
-) -> None:
     if len(genome_graph[start]) < 2:  # Cannot be the source of a bubble.
         return
 

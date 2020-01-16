@@ -5,7 +5,9 @@ Minimap and miniasm in Python.
 
 Requirements
 ------------
-For this program the minimum is Python version 3.6.
+For this program the minimum required is Python version 3.6.
+
+No additional requirements needed.
 
 README
 ------
@@ -15,21 +17,24 @@ You can run one or the other using the first argument, followed by the other
 arguments.
 
 For example:
-python3 $this_file_name.py minimap query.fq target.fq > output.paf
+python3 hielkewalinga_4374561_minimap-miniasm.py minimap query.fq target.fq > output.paf
 
 For more details, you can use the --help flag to one of the subprograms:
-python3 $this_file_name.py miniasm --help
+python3 hielkewalinga_4374561_minimap-miniasm.py miniasm --help
 
 NB.
 
-There is also a third subprogram, which is the test subprogram. This will
+There is also a third subprogram, which is the 'test' subprogram. This will
 run the unittest included in this program.
+
+There is also a fourth subprogram 'mytest', used for debugging.
 """
 
 import argparse
 import heapq
 import sys
 import unittest
+from argparse import Namespace
 from collections import defaultdict, deque
 from functools import partial
 from itertools import chain, groupby, islice, repeat, tee
@@ -39,9 +44,6 @@ from typing import IO, Callable, Dict, Iterable, Iterator, List, Optional, Set, 
 ###########
 # MINIMAP #
 ###########
-
-complement = str.maketrans("ACGT", "TGCA")
-
 
 # Type aliases minimap
 
@@ -61,12 +63,13 @@ Target_Index = Dict[int, List[Tuple[str, int, bool]]]
 # A dictionary that maps the sequence name to the length.
 Seq_Lens = Dict[str, int]
 
-# For PAF we will use fields 1-11. So not using the quality one, and optional additional
+# For PAF we will use fields 1-11.
+# So not using the quality one, and optional additional fields.
 Strand_Range = Tuple[str, int, int, int]
 PAF = Tuple[Strand_Range, str, Strand_Range, Tuple[int, int]]
 
 
-def reverse_complement(s: str) -> str:
+def reverse_complement(s: str, complement=str.maketrans("ACGT", "TGCA")) -> str:
     """
     Create the reverse complement of sequence
     """
@@ -102,7 +105,7 @@ def sliding_windowing(s: str, k: int) -> Iterator[str]:
     return map("".join, zip(*texts))
 
 
-def hash_seq(s: str) -> int:
+def hash_seq(s: str, base_values={"A": 0, "C": 1, "G": 2, "T": 3}) -> int:
     """
     Hash a sequence (or k-mer).
 
@@ -121,12 +124,11 @@ def hash_seq(s: str) -> int:
     x : int
         Returns the integer hashed
     """
-    base_values = {"A": 0, "C": 1, "G": 2, "T": 3}
     k = len(s)
-    return sum(base_values[b] * 4 ** (k - i) for i, b in enumerate(s))
+    return sum(base_values[b] * 4 ** (k - i - 1) for i, b in enumerate(s))
 
 
-def invertable_hash(x: int, p: int) -> int:
+def invertable_hash(x: int, p: int = 64) -> int:
     """
     Invertible integer hash function.
 
@@ -150,6 +152,11 @@ def invertable_hash(x: int, p: int) -> int:
     -------
     x : int
         Return the new hash integer.
+
+    Notes
+    -----
+    The paper mentions that the hash should be a 2 * k bit hash. However
+    the tests included of in the project assume p=64, so I went with that instead.
     """
     m = 2 ** p - 1
     x = (~x + (x << 21)) & m
@@ -236,10 +243,7 @@ def get_func_minimizer_sketch(w: int, k: int) -> Minimizer_Sketch:
         A function that takes a sequence and returns the minimizers
     """
     return partial(
-        compute_minimizers,
-        w=w,
-        k=k,
-        hash_func=lambda s: invertable_hash(hash_seq(s), 2 * k),
+        compute_minimizers, w=w, k=k, hash_func=lambda s: invertable_hash(hash_seq(s)),
     )
 
 
@@ -270,11 +274,7 @@ def index_targets(
 
 
 def map_query(
-    query_seq: str,
-    qname: str,
-    target_seq_info: Seq_Lens,
-    H: Target_Index,
-    args: argparse.Namespace,
+    qseq: str, qname: str, seq_lens: Seq_Lens, H: Target_Index, args: Namespace,
 ) -> Iterable[PAF]:
     """
     Takes a query and maps it to the target indexers.
@@ -288,6 +288,9 @@ def map_query(
 
     Notes
     -----
+    PAF file : A PAF file is used to describe mapings. It is a tab seperated file
+    with te following fields:
+
     1	string	Query sequence name
     2	int	Query sequence length
     3	int	Query start coordinate (0-based)
@@ -301,7 +304,7 @@ def map_query(
     11	int	Number bases, including gaps, in the mapping
     12	int	Mapping quality (0-255 with 255 for missing)
     """
-    M = args.minimizer_sketch(query_seq)
+    M = args.minimizer_sketch(qseq)
     A = []
 
     # Collect minimizers hit
@@ -336,9 +339,9 @@ def map_query(
             eh = potential_overlap[indices[-1]]
             mapped_bp = len(indices) * args.k
 
-            qlen = len(query_seq)
+            qlen = len(qseq)
             tname = potential_overlap[0][0]
-            tlen = target_seq_info[tname]
+            tlen = seq_lens[tname]
 
             orientation = "-" if bh[1] == 1 else "+"
 
@@ -440,10 +443,11 @@ def read_fastx(file: IO, format: str) -> Iterator[Tuple[str, str]]:
         if ind % group_size == 0:
             seq_name = line.strip()
             _, seq = next(ind_line)[1].strip()
-            yield seq_name, seq
+            # We will always use upper case sequences
+            yield seq_name, seq.upper()
 
 
-def minimap(target_file: IO, query_file: IO, output_file: IO, args: argparse.Namespace):
+def minimap(target_file: IO, query_file: IO, output_file: IO, args: Namespace):
     """
     This is the minimap function
     """
@@ -452,10 +456,10 @@ def minimap(target_file: IO, query_file: IO, output_file: IO, args: argparse.Nam
 
     args.minimizer_sketch = get_func_minimizer_sketch(args.w, args.k)
 
-    H, target_seq_info = index_targets(target_seqs, args.minimizer_sketch)
+    H, seq_lens = index_targets(target_seqs, args.minimizer_sketch)
 
-    for query_name, query_seq in query_seqs:
-        for t in map_query(query_seq, query_name, target_seq_info, H, args):
+    for qname, qseq in query_seqs:
+        for t in map_query(qseq, qname, seq_lens, H, args):
             # We don't calculate quality, so we just print 255 there.
             print(*chain(*t), 255, sep="\t", file=output_file)
 
@@ -485,8 +489,23 @@ def read_paf_file(paf_file: IO) -> Iterator[PAF]:
     """
     Just read the file and yields each line as a paf tuple.
 
-    The PAF file is tab delimited file with the fields:
+    Notes
+    -----
+    PAF file : A PAF file is used to describe mapings. It is a tab seperated file
+    with te following fields:
 
+    1	string	Query sequence name
+    2	int	Query sequence length
+    3	int	Query start coordinate (0-based)
+    4	int	Query end coordinate (0-based)
+    5	char	‘+’ if query/target on the same strand; ‘-’ if opposite
+    6	string	Target sequence name
+    7	int	Target sequence length
+    8	int	Target start coordinate on the original strand
+    9	int	Target end coordinate on the original strand
+    10	int	Number of matching bases in the mapping
+    11	int	Number bases, including gaps, in the mapping
+    12	int	Mapping quality (0-255 with 255 for missing)
     1	string	Query sequence name
     2	int	Query sequence length
     3	int	Query start coordinate (0-based)
@@ -522,16 +541,18 @@ def read_paf_file(paf_file: IO) -> Iterator[PAF]:
         yield paf
 
 
-def clean_small_overlaps(pafs, min_overlap_size, min_matching_bp):
+def clean_small_overlaps(
+    pafs: Iterable[PAF], min_overlap_size: int, min_matching_bp: int
+) -> Iterator[PAF]:
     """
     Step 2.1
 
-    Remove all pafs that have an overlap too small and/or a matching region
-    too small.
+    Remove all pafs that have an overlap too small and/or a matching region too small.
 
     Returns
     -------
-    pafs
+    pafs : Iterator[PAF]
+        An iterable with pafs.
     """
     return filter(
         lambda p: p[3][0] > min_matching_bp and p[3][1] > min_overlap_size, pafs
@@ -950,7 +971,7 @@ def create_unitigs(
 # Print to file functions.
 
 
-def print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out):
+def gfa(genome_graph, unitig_to_reads, read_seqs):
     """
     ...
     """
@@ -958,32 +979,36 @@ def print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out):
     def get_ori(ori: bool) -> str:
         return "+" if ori else "-"
 
-    def gfa():
-        for name, ori in genome_graph.keys():
-            seq = read_seqs[name]
-            if seq:
-                yield "S", name, seq
-                continue
+    for name, ori in genome_graph.keys():
+        seq = read_seqs[name]
+        if seq:
+            yield "S", name, seq
+            continue
 
-            # It's a utg
-            utg_name = name
-            utg_path = iter(unitig_to_reads[utg_name])
-            name, ori = next(utg_path)[0]
-            new_seq = read_seqs[name] if ori else complement(read_seqs[name])
-            for (name, ori), maplen in utg_path:
-                add_seq = read_seqs[name] if ori else complement(read_seqs[name])
-                new_seq += add_seq[maplen:]
-            yield "S", utg_name, new_seq
+        # It's a utg
+        utg_name = name
+        utg_path = iter(unitig_to_reads[utg_name])
+        name, ori = next(utg_path)[0]
+        new_seq = read_seqs[name] if ori else reverse_complement(read_seqs[name])
+        for (name, ori), maplen in utg_path:
+            add_seq = read_seqs[name] if ori else reverse_complement(read_seqs[name])
+            new_seq += add_seq[maplen:]
+        yield "S", utg_name, new_seq
 
-        for v, edges in genome_graph.items():
-            for (w, maplen) in edges:
-                yield "L", v[0], get_ori(v[1]), w[0], get_ori(w[1]), f"{maplen}M"
+    for v, edges in genome_graph.items():
+        for (w, maplen) in edges:
+            yield "L", v[0], get_ori(v[1]), w[0], get_ori(w[1]), f"{maplen}M"
 
-    for line in gfa():
+
+def print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out):
+    """
+    ...
+    """
+    for line in gfa(genome_graph, unitig_to_reads, read_seqs):
         print(*line, sep="\t", file=out)
 
 
-def miniasm(paf_file: IO, reads_file: IO, out: IO, args: argparse.Namespace):
+def miniasm(paf_file: IO, reads_file: IO, out: IO, args: Namespace):
     """
     This is the miniasm function.
     """
@@ -1024,12 +1049,22 @@ def miniasm(paf_file: IO, reads_file: IO, out: IO, args: argparse.Namespace):
 #########
 
 
+def mytest():
+    pass
+
+
 class TestSuite(unittest.TestCase):
     def test_hash(self):
-        pass
+        seq = "TTA"
+        h = hash_seq(seq)
+        self.assertEqual(h, 60)
 
-    def test_seq_hash(self):
-        pass
+    def test_invertible_hash(self):
+        new_h = invertable_hash(60)
+        self.assertEqual(new_h, 9473421487448830983)
+
+    def test_find_minimizers(self):
+        seq = "GATTACAACT"
 
 
 if __name__ == "__main__":
@@ -1095,7 +1130,7 @@ if __name__ == "__main__":
 
     overlapping = miniasm_argparser.add_argument_group("Overlapping options")
     overlapping.add_argument(
-        "-h", "--max-overhang", help="Maximum overhang length", default=1000, type=int
+        "-H", "--max-overhang", help="Maximum overhang length", default=1000, type=int
     )
     overlapping.add_argument(
         "-I",
@@ -1123,13 +1158,15 @@ if __name__ == "__main__":
 
     subparsers.add_parser("test", help="Run the unittests.")
 
-    subprograms = {"minimap", "miniasm", "test"}
+    subprograms = {"minimap", "miniasm", "test", "mytest"}
     if sys.argv[1] not in subprograms:
         print(f"You did not select a correct sub program: {subprograms}")
         sys.exit(1)
 
     if sys.argv[1] == "test":
-        unittest.main()
+        unittest.main(argv=["ignore-this"])
+    elif sys.argv[1] == "mytest":
+        mytest()
     else:
         args = parser.parse_args()
         if sys.argv[1] == "minimap":

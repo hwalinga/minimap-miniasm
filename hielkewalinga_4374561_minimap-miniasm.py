@@ -22,6 +22,8 @@ python3 hielkewalinga_4374561_minimap-miniasm.py minimap query.fq target.fq > ou
 For more details, you can use the --help flag to one of the subprograms:
 python3 hielkewalinga_4374561_minimap-miniasm.py miniasm --help
 
+The main program accepts a --help as well.
+
 NB.
 
 There is also a third subprogram, which is the 'test' subprogram. This will
@@ -1069,7 +1071,13 @@ class TestSuite(unittest.TestCase):
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(prog="MINIMAP-MINIASM")
+    parser = argparse.ArgumentParser(
+        prog="MINIMAP-MINIASM",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="This program contains a minimap and a miniasm implementation."
+        " Run one of them by providing the first word the same as that program."
+        " Those subprograms contain a --help as well.",
+    )
 
     # The '-' for files types indicates stdin or stdout.
     parser.add_argument("--out", type=argparse.FileType("w"), default="-")
@@ -1077,7 +1085,17 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(help="MINIMAP-MINIASM")
 
     # minimap argument parsing
-    minimap_argparser = subparsers.add_parser("minimap", help="Map sequences.")
+    minimap_argparser = subparsers.add_parser(
+        "minimap",
+        help="Map sequences.",
+        description="This is the minimap program."
+        " Arguments have the same flags as the minimap program,"
+        " but also have a longer name option. Defaults are equal as well."
+        " Not all options are included."
+        " The -L flag can only be found in the original minimap program,"
+        " but not in the new minimap2 program.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     minimap_argparser.add_argument("target", type=argparse.FileType("r"))
     minimap_argparser.add_argument("query", type=argparse.FileType("r"))
 
@@ -1109,7 +1127,17 @@ if __name__ == "__main__":
     )
 
     # miniasm argument parsing
-    miniasm_argparser = subparsers.add_parser("miniasm", help="Assembly from PAF file.")
+    miniasm_argparser = subparsers.add_parser(
+        "miniasm",
+        help="Assembly from PAF file.",
+        description="This is the miniasm program."
+        " Arguments have the same flags as the minimap program,"
+        " but also have a longer name option. Defaults are equal as well."
+        " Not all options are included."
+        " The -h option for miniasm has been changed to the -H option"
+        " as it conflicts with the -h, --help option.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     miniasm_argparser.add_argument("paf", type=argparse.FileType("r"))
 
     preselection = miniasm_argparser.add_argument_group("Preselection options")
@@ -1157,8 +1185,10 @@ if __name__ == "__main__":
     )
 
     subparsers.add_parser("test", help="Run the unittests.")
+    subparsers.add_parser("mytest", help="Run some debugging function.")
 
-    subprograms = {"minimap", "miniasm", "test", "mytest"}
+    subprograms = {"minimap", "miniasm", "test", "mytest", "--help", "-h"}
+
     if sys.argv[1] not in subprograms:
         print(f"You did not select a correct sub program: {subprograms}")
         sys.exit(1)

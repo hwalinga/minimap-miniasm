@@ -71,7 +71,9 @@ Strand_Range = Tuple[str, int, int, int]
 PAF = Tuple[Strand_Range, str, Strand_Range, Tuple[int, int]]
 
 
-def reverse_complement(s: str, complement=str.maketrans("ACGT", "TGCA")) -> str:
+def reverse_complement(
+    s: str, complement: Dict[int, Optional[int]] = str.maketrans("ACGT", "TGCA")
+) -> str:
     """
     Create the reverse complement of sequence
     """
@@ -107,7 +109,9 @@ def sliding_windowing(s: str, k: int) -> Iterator[str]:
     return map("".join, zip(*texts))
 
 
-def hash_seq(s: str, base_values={"A": 0, "C": 1, "G": 2, "T": 3}) -> int:
+def hash_seq(
+    s: str, base_values: Dict[str, int] = {"A": 0, "C": 1, "G": 2, "T": 3}
+) -> int:
     """
     Hash a sequence (or k-mer).
 
@@ -120,6 +124,9 @@ def hash_seq(s: str, base_values={"A": 0, "C": 1, "G": 2, "T": 3}) -> int:
     ----------
     s : str
         s is the sequence (or k-mer) that needs to be hashed
+    base_values : Dict[str, int]
+        This is a dict that maps the base pair to the value used in the hash.
+        Default is {"A": 0, "C": 1, "G": 2, "T": 3}
 
     Returns
     -------
@@ -228,7 +235,9 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
     return M
 
 
-def get_func_minimizer_sketch(w: int, k: int) -> Minimizer_Sketch:
+def get_func_minimizer_sketch(
+    w: int, k: int, hash_func: Seq_Hash = lambda s: invertable_hash(hash_seq(s))
+) -> Minimizer_Sketch:
     """
     A function to set all values to the :func:`compute_minimizers` function.
 
@@ -238,15 +247,16 @@ def get_func_minimizer_sketch(w: int, k: int) -> Minimizer_Sketch:
         Amount of k-mers in window.
     k : int
         Length of the k-mer.
+    hash_func : Seq_Hash
+        A function to map a sequence (str) to a hash integer.
+        Defaults to the invertible hash from the minimap/miniasm paper.
 
     Returns
     -------
     minimizer_sketch : Minimizer_Sketch
         A function that takes a sequence and returns the minimizers
     """
-    return partial(
-        compute_minimizers, w=w, k=k, hash_func=lambda s: invertable_hash(hash_seq(s)),
-    )
+    return partial(compute_minimizers, w=w, k=k, hash_func=hash_func,)
 
 
 def index_targets(
@@ -1067,6 +1077,7 @@ class TestSuite(unittest.TestCase):
 
     def test_find_minimizers(self):
         seq = "GATTACAACT"
+        minimizer_sketch = get_func_minimizer_sketch(w=4, k=3)
 
 
 if __name__ == "__main__":

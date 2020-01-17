@@ -22,7 +22,7 @@ python3 hielkewalinga_4374561_minimap-miniasm.py minimap query.fq target.fq > ou
 For more details, you can use the --help flag to one of the subprograms:
 python3 hielkewalinga_4374561_minimap-miniasm.py miniasm --help
 
-The main program accepts a --help as well.
+The main program (without supplying a subprogram) accepts a --help as well.
 
 NB.
 
@@ -31,7 +31,7 @@ run the unittest included in this program. These unittest reflect the tests
 given on the project page of this project.
 https://abeellab.github.io/cs4255/minimap-doc.html
 
-There is also a fourth subprogram 'mytest', used for debugging.
+There is also a fourth subprogram 'mytest', used for debugging purposes.
 """
 
 import argparse
@@ -43,7 +43,18 @@ from collections import defaultdict, deque
 from functools import partial
 from itertools import chain, groupby, islice, repeat, tee
 from operator import itemgetter
-from typing import IO, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import (
+    IO,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 ###########
 # MINIMAP #
@@ -166,8 +177,12 @@ def invertable_hash(x: int, p: int = 64) -> int:
 
     Notes
     -----
-    The paper mentions that the hash should be a 2 * k bit hash. However
+    The paper mentions that the hash can be a 2 * k bit hash. However
     the tests included of in the project assume p=64, so I went with that instead.
+    However, p=63 would make a bit more sense, as that is the maximum size of
+    Python integer (So, one bit smaller than a C integer size). Luckily this
+    isn't a big problem as Python will increase the memory size of an integer
+    automatically if it will overflow.
     """
     m = 2 ** p - 1
     x = (~x + (x << 21)) & m
@@ -205,6 +220,36 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
         Where m is the hash integer,
         i is the position where the k-mer starts. (Also start position on reverse)
         r is the strand
+
+    Notes
+    -----
+    NB. In the test set the starting coords of the minimizers is
+    reversed if the minimizer is found on the reverse strand.
+    This is however different from the given pseudocode which does not perform
+    this reversal. The reason is explained here.
+
+    Algo 4 will also not work if you perform the reversal.
+    The reason for this is that the clustering is performed
+    on i + i_t instead of i - i_t for opposite strands.
+
+    Different strands use a different invariant to find minimizers
+    with the same maplen, as shown below:
+    The invariants:
+    Same strand: i - i_t = qlen - maplen
+    Opposite strand: i + i_t = qlen + tlen - maplen
+
+    Of course this wasn't needed when we would use reversed coords for different
+    strands, but the convenience comes in the final end of the implementation.
+
+    Here we made a distinction between a qeury-target mapping on the same strands
+    and a query-target mapping on different strands. What is convenient is that
+    a query-target mapping is the same as a query(reversed)-target(reversed) mapping,
+    and that a query(reversed)-target mapping is the same as a query-target(reversed)
+    mapping. However, since we did not reverse any coords we can just output a
+    query-target mapping for a query(reversed)-target(reversed) mapping (same strand),
+    and a query-target(reversed) mapping for a query(reversed)-target mapping.
+    Conveniently we only reverse coords for the target strand, when the mapping
+    is not on the same strand.
     """
     kmers = sliding_windowing(s, k)
     w_window = deque(islice(kmers, w))
@@ -215,15 +260,11 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
 
         # Find minimum k-mer
         m = sys.maxsize  # 2 ** 63 - 1 on 64 bit platforms.
-        print("START M")
         for j, kmer in enumerate(w_window):
-            print(kmer)
             u, v = hash_func(kmer), hash_func(reverse_complement(kmer))
-            print(u, v)
             if u != v:  # If reverse complement the same sequence, do not use.
                 m = min(m, u, v)
 
-        print(m)
         # Add minimizer
         for j, kmer in enumerate(w_window):
             u, v = hash_func(kmer), hash_func(reverse_complement(kmer))
@@ -231,7 +272,6 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
                 # NB. We do not reverse the coord here, but use different invariants
                 # for the opposite strands. See Algo 4: compute_minimizers
                 M.add((m, i + j, v < u))
-        print(M)
 
         # Move w window one k-mer further. (If not more k-mers, we are done.)
         new_kmer = next(kmers, None)
@@ -264,7 +304,21 @@ def get_func_minimizer_sketch(
     -------
     minimizer_sketch : Minimizer_Sketch
         A function that takes a sequence and returns the minimizers
+
+    Raises
+    ------
+    Exception
+        If k * 2 is larger than the bit of the hash, do not proceed.
+
+        As integers can be arbitrarily large in Python, changing the hardcoded
+        hash size (p) can be used to run with a 'k' larger than 32.
+
+        You can probably run with a larger k anyway, as hash collisions aren't
+        that bad. During clustering of minimizer hits this is dealt with as
+        minimizer hits aren't guaranteed to be correct.
     """
+    if k >= 32:
+        raise Exception("k is too big")
     return partial(compute_minimizers, w=w, k=k, hash_func=hash_func,)
 
 
@@ -331,6 +385,8 @@ def map_query(
     # Collect minimizers hit
     for h, i, r in M:
         for t, i_t, r_t in H[h]:
+            if t == qname:
+                continue  # Do not map the same read to the same read.
             # NB. For opposite strand the coord is not reversed,
             # therefore use the invariants for the third element as such:
             # Same strand: i - i_t = qlen - maplen
@@ -342,7 +398,8 @@ def map_query(
             else:
                 A.append((t, 1, i + i_t, i_t))
 
-    # Python automatically sorts tuples with radix sort, which we want here.
+    # Python automatically sorts tuples with radix sort if no key provided.
+    # This is what we want here.
     A.sort()
 
     b = 0
@@ -360,7 +417,27 @@ def map_query(
             potential_overlap = A[b:e]
             b = e + 1
 
-            indices = maximum_colinear_subset(map(itemgetter(3), potential_overlap))
+            orientation = "-" if potential_overlap[0][1] == 1 else "+"
+
+            # Find the maximum colinear subset by finding the longest increasing
+            # subset of the target positions.
+            # Notice that for the invariants above, the only factor that can
+            # change slightly is the map length.
+            # Find the longest increasing subset will make sure that the small
+            # variations in the map length does not cause a target coord to
+            # be shifted that far that it starts mixing with another match.
+
+            if orientation == "-":
+                # Since we use coords that have not been reversed for opposite
+                # mappings we have to find the longest decreasing subset here.
+                potential_overlap.reverse()
+                indices = longest_decreasing_subset(
+                    map(itemgetter(3), potential_overlap)
+                )
+            else:
+                indices = longest_increasing_subset(
+                    map(itemgetter(3), potential_overlap)
+                )
 
             # We have now a (potential) cluster that represents a mapping.
             # Now use this cluster to create paf or reject the cluster.
@@ -368,26 +445,33 @@ def map_query(
             # NB. lh3/minimap breaks this chain if
             # there is a gap longer than -g=10000, I do not.
 
-            if len(indices) < args.min_subset:
-                # Not enough minimizers in this mapping. Do not use.
+            if len(indices) <= args.min_subset:
+                # Not enough minimizers in this mapping, we do not use this cluster.
                 continue
 
-            bh = potential_overlap[indices[0]]
-            eh = potential_overlap[indices[-1]]
+            bh = potential_overlap[indices[0]]  # First minimizer for query
+            eh = potential_overlap[indices[-1]]  # Last minimizer for query
+
+            # Does not check for overlapping minimizers
             mapped_bp = len(indices) * args.k
 
             qlen = len(qseq)
             tname = potential_overlap[0][0]
             tlen = seq_lens[tname]
 
-            orientation = "-" if bh[1] == 1 else "+"
-
             # Undo the transformation, and find the exact coords of the ranges.
-            if orientation != "-":  # same strand
+            if orientation == "+":  # (+) same strand
                 tstart, tend = bh[3], eh[3] + args.k
                 qstart, qend = bh[2] + bh[3], eh[2] + eh[3] + args.k
-            else:  # Opposite strand
-                tstart, tend = eh[3] - args.k, bh[3]
+            else:  # Opposite strand (-)
+                # Note: here we finally reverse the coordinates of the target strand.
+                # The only place where we do that is here!
+                # It could be that in fact query was reversed here, but still
+                # that doesn't matter as query(reversed)-target is equivalent
+                # to query-target(reversed), so we pick the latter always,
+                # and do not have to bother with reversing query, as we never
+                # reversed before.
+                tstart, tend = tlen - bh[3] - args.k, tlen - eh[3]
                 qstart, qend = bh[2] - bh[3], eh[2] - eh[3] + args.k
 
             maplen = max(qend - qstart, tend - tstart)
@@ -404,7 +488,16 @@ def map_query(
             yield paf
 
 
-def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
+def longest_decreasing_subset(seq: Iterable[int]) -> List[int]:
+    seq = list(seq)
+    seq.reverse()
+    indices = longest_increasing_subset(seq)
+    indices_reversed = [len(seq) - ind - 1 for ind in indices]
+    indices_reversed.reverse()
+    return indices_reversed
+
+
+def longest_increasing_subset(seq: Iterable[int]) -> List[int]:
     """
     Find the longest increasing subsequence.
 
@@ -416,6 +509,8 @@ def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
         Returns the indices of the longest increasing subsequence.
     """
     seq = list(seq)
+    if not seq:
+        return seq
 
     P: List[Optional[int]] = [None]
     M = [0]
@@ -432,7 +527,7 @@ def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
         else:
             while up - lo > 1:
                 mid = (lo + up) // 2
-                if seq[M[up - 1]] < seq[i]:
+                if seq[M[mid - 1]] < seq[i]:
                     lo = mid
                 else:
                     up = mid
@@ -442,7 +537,7 @@ def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
                 M[j] = i
 
         # Update P
-        P.append(M[j - 1])
+        P.append(None if j == 0 else M[j - 1])
 
     # Trace back using the predecessor array (P).
     def trace(i):
@@ -454,7 +549,7 @@ def maximum_colinear_subset(seq: Iterable[int]) -> List[int]:
     return indices
 
 
-def read_fastx(file: IO, format: str) -> Iterator[Tuple[str, str]]:
+def read_fastx(file: IO) -> Iterator[Tuple[str, str]]:
     """
     Currently, this function just assumes for fasta that the sequences and the
     fasta header are on alternating lines.
@@ -470,26 +565,32 @@ def read_fastx(file: IO, format: str) -> Iterator[Tuple[str, str]]:
     it : Iterator[Tuple[str, str]]
         Returns an iterator that yields tuples with the sequence name and the sequence.
     """
-    if format == "fastq":
-        group_size = 4
-    elif format == "fasta":
+    first_line = next(file)
+    if first_line[0] == ">":
         group_size = 2
+    elif first_line[0] == "@":
+        group_size = 4
+    else:
+        raise Exception(f"Something is wrong with the file {file.name}")
 
-    ind_line = enumerate(file)
+    ind_line = enumerate(chain([first_line], file))
     for ind, line in ind_line:
         if ind % group_size == 0:
-            seq_name = line.strip()
-            _, seq = next(ind_line)[1].strip()
+            seq_name = line.strip()[1:]
+            _, seq = next(ind_line)
             # We will always use upper case sequences
-            yield seq_name, seq.upper()
+            yield seq_name, seq.strip().upper()
 
 
 def minimap(target_file: IO, query_file: IO, output_file: IO, args: Namespace):
     """
     This is the minimap function
     """
-    target_seqs = read_fastx(target_file, format="fastq")
-    query_seqs = read_fastx(query_file, format="fastq")
+    if not args.w:
+        args.w = round(2 * args.k / 3)  # Default is 2 / 3 of k.
+
+    target_seqs = read_fastx(target_file)
+    query_seqs = read_fastx(query_file)
 
     args.minimizer_sketch = get_func_minimizer_sketch(args.w, args.k)
 
@@ -509,8 +610,10 @@ def minimap(target_file: IO, query_file: IO, output_file: IO, args: Namespace):
 # A Mapping is described by two strings: The names of the query and the target,
 # and one more string to describe if they match on the same strand or opposite
 # (Just like in PAF.)
-All_Mappings = Dict[Tuple[str, str, str], List[Tuple[int, int, int, int]]]
 Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
+
+# The all mappings dict is used to trim ranges that don't have enough mapped coverage.
+All_Mappings = Dict[str, List[Tuple[int, int, int, int, str, str]]]
 
 # In the genome graph each strand is described with the name and a bool
 # to indicate strand side. If True, it is the same strand,
@@ -519,7 +622,7 @@ Mappings = Dict[Tuple[str, str, str], Tuple[int, int, int, int]]
 # The other integer indicates the lenght of the mapping.
 # The key value pairs indicate from-to mapping.
 Vertex = Tuple[str, bool]
-Genome_Graph = Dict[Vertex, List[Tuple[Vertex, int]]]
+Genome_Graph = DefaultDict[Vertex, List[Tuple[Vertex, int]]]
 
 
 def read_paf_file(paf_file: IO) -> Iterator[PAF]:
@@ -623,27 +726,25 @@ def filter_overlaps_and_create_seq_lens(
     seq_lens: Seq_Lens = dict()
 
     for query, orientation, target, mapping_info in pafs:
-        mappings[query[0], target[0], orientation].append(
-            (query[2], query[3], target[2], target[3])
+        mappings[query[0]].append(
+            (query[2], query[3], target[2], target[3], target[0], orientation)
         )
         seq_lens[query[0]] = query[1]
 
     # trim_mapping function will trim the mapping based on the list of mappings
     # and the min_coverage.
-    trimmed_mappings_iter = (
-        (key, trim_mapping(mappings_list, min_coverage))
-        for key, mappings_list in mappings.items()
-    )
 
-    # The trim_mapping function will return None if there is no mapping with
-    # the min_coverage. This is filtered out here.
     trimmed_mappings: Mappings = {
-        key: trimmed for key, trimmed in trimmed_mappings_iter if trimmed
+        (qname, trimmed_mapping[4], trimmed_mapping[5]): trimmed_mapping[:4]
+        for qname, mappings_list in mappings.items()
+        for trimmed_mapping in trim_mappings(mappings_list, min_coverage)
     }
     return trimmed_mappings, seq_lens
 
 
-def trim_mapping(mapping_list, min_coverage) -> Optional[Tuple[int, int, int, int]]:
+def trim_mappings(
+    mappings_list: List[Tuple[int, int, int, int, str, str]], min_coverage: int
+) -> Iterator[Tuple[int, int, int, int, str, str]]:
     """
     Trim the mappings where the min_coverage is not achieved.
 
@@ -652,20 +753,65 @@ def trim_mapping(mapping_list, min_coverage) -> Optional[Tuple[int, int, int, in
 
     Returns
     -------
-    mapping : Tuple[int, int, int, int]
+    trimmed_mapping_list : List[Tuple[int, int, int, int, str, str]]
         The mapping with query start and end, and target start and end.
 
-    If there will be no mapping left after trimming return None.
+    If there will be no mapping left it is not included in the list again.
+
+    Notes
+    -----
+    For this algorithm there is still an unresolved edge case. That is, when a
+    mapping can be found in two different trimmed ranges, it is unclear if
+    this mapping should be cut in two. Here we just keep the first half.
     """
-    q_map_strand = map_on_strand(((m[0], m[1]) for m in mapping_list), min_coverage)
-    t_map_strand = map_on_strand(((m[2], m[3]) for m in mapping_list), min_coverage)
-
-    # Only return the mapping if both have enough coverage.
-    # Checking both will ensure symmetry as well.
-    return (*q_map_strand, *t_map_strand) if q_map_strand and t_map_strand else None
+    trimmed_ranges_it = find_minimum_coverage_range(
+        ((m[0], m[1]) for m in mappings_list), min_coverage
+    )
+    return trim_mappings_with_ranges(mappings_list, trimmed_ranges_it)
 
 
-def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
+def trim_mappings_with_ranges(
+    mappings_list: List[Tuple[int, int, int, int, str, str]],
+    trimmed_ranges_it: Iterator[Tuple[int, int]],
+) -> Iterator[Tuple[int, int, int, int, str, str]]:
+
+    trim_start, trim_end = next(trimmed_ranges_it)
+    for mapping in sorted(mappings_list, key=itemgetter(0)):
+        qstart, qend, tstart, tend, tname, ori = mapping
+
+        # Move to a new trimmed range if needed
+        while qstart > trim_end:
+            trim_range = next(trimmed_ranges_it, None)
+            if not trim_range:
+                return
+            trim_start, trim_end = trim_range
+
+        qtrim, etrim = 0, 0
+
+        if trim_start > qstart:  # Not inside trimmed range -> trim
+            strim = trim_start - qstart
+            qstart = trim_start
+
+        if trim_end < qend:  # Not inside trimmed_range
+            etrim = qend - trim_end
+            qend = trim_end
+
+        if not qtrim and not etrim:  # No trimming, prevent tuple reconstruction.
+            yield mapping
+        else:
+            # We trim the target range as well with the same parameters.
+            # There can however be an edge case where the target range is
+            # slightly different and give an invalid range, then we just
+            # skip it completely
+            tstart = tstart + strim
+            tend = tend - etrim
+            if tstart < tend and tstart > 0 and tend > 0:
+                yield qstart, qend, tstart, tend, tname, ori
+
+
+def find_minimum_coverage_range(
+    coords: Iterable[Tuple[int, int]], min_coverage: int
+) -> Iterator[Tuple[int, int]]:
     """
     Trim the coordinates for minimum coverage.
 
@@ -674,6 +820,11 @@ def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
     ranges. Each time we process a new range, we remove all the end coordinates
     that are before the beginning of the current range. Now the size of the
     priority queue is equal to the coverage.
+
+    Returns
+    -------
+    trimmed_mappings_it : Iterator[Tuple[int, int]]
+        Returns the trimmed ranges in sorted order as an iterator.
     """
     # Use heapq as a min heap to use as a priority qeueu
     end_coords: List[int] = []
@@ -703,13 +854,8 @@ def map_on_strand(coords, min_coverage) -> Optional[Tuple[int, int]]:
                 trimmed_range_start.append(b)
                 in_range = True
 
-    # Now return the maximum range with min_coverage
-    if trimmed_range_start:
-        return max(
-            zip(trimmed_range_start, trimmed_range_end), key=lambda c: c[1] - c[0]
-        )
-    else:
-        return None
+    # Now return all the trimmed ranges with the minimum coverage
+    return zip(trimmed_range_start, trimmed_range_end)
 
 
 def create_genome_graph(
@@ -800,6 +946,10 @@ def remove_transitive_edges(
 ) -> None:
     """
     Myers 2005
+
+    This function goes through the genome graph and removes transitive edges.
+    These are edges that have a mapping that is not really needed as other
+    edges already show that the nodes relate.
     """
 
     def edge_len(edge_info: Tuple[Vertex, int]) -> int:
@@ -808,9 +958,9 @@ def remove_transitive_edges(
 
     for val in genome_graph.values():
         # Sort all edges so that the longest
-        val.sort(key=edge_len, reverse=True)
+        val.sort(key=edge_len)
 
-    # This dict has the following convention: {0: vacant, 1: inplay, 2: elimated}
+    # This dict has the following convention: {0: vacant, 1: inplay, 2: eliminated}
     vertices_dict: Dict[Vertex, int] = dict.fromkeys(vertices, 0)
 
     for v in vertices:
@@ -823,17 +973,21 @@ def remove_transitive_edges(
             if vertices_dict[w] != 1:
                 continue
             v2w_len = edge_len((w, maplen_w))
-            first = True
-            for x, maplen_x in genome_graph[w]:
+            edge_it = iter(genome_graph[w])
 
-                # Check the smallest edge of w.
-                if first and vertices_dict[x] == 1:
-                    vertices_dict[x] == 2  # eliminated
-                first = False
+            # Check the smallest edge of w
+            x, maplen = next(edge_it)
+            if vertices_dict[x] == 1:
+                vertices_dict[x] == 2  # eliminated
+
+            for x, maplen_x in edge_it:
 
                 # Check all edges smaller than fuzz.
                 if edge_len((x, maplen_x)) < fuzz and vertices_dict[x] == 1:
-                    vertices_dict[x] == 2
+                    vertices_dict[x] == 2  # eliminated
+                # With fuzz=10, this might seem very small,
+                # but the coverage trimming might
+                # reduce a mapping below what you could get from minimap
 
                 # When edge too long, we don't have to check anymore
                 if v2w_len + edge_len((x, maplen_x)) > longest:
@@ -848,22 +1002,26 @@ def remove_transitive_edges(
                 new_edges.append((w, maplen))
             vertices_dict[w] = 0
 
-        genome_graph[v] = new_edges
+        if new_edges:
+            genome_graph[v] = new_edges
+        else:
+            del genome_graph[v]
 
 
-def remove_small_tip(genome_graph, min_size_tip, v):
+def remove_small_tip(genome_graph: Genome_Graph, min_size_tip: int, v: Vertex) -> None:
     """
-    ...
+    Checks if v is the end of a small tip (a small tip is defined if it connects
+    to something biggers within min_size_tip nodes).
     """
-    # We find the tip of the tip of edges,
+    # We find the tip of edges,
     # by inspecting if the symmetry vertex does not contain edges.
-    if genome_graph[v[0], not v[1]]:
+    if genome_graph.get((v[0], not v[1])):
         return
 
     # This is a tip, see if it is small.
 
     # Follow incoming edges and see if we hit a junction within min_size_tip.
-    tip_consists = []
+    tip_consists: List[Vertex] = []
     for _ in repeat(None, min_size_tip):
         # We check if there are more than one edges in the vertex and its complement.
         # If there is more than one in one of them, this is a junction,
@@ -888,6 +1046,13 @@ def pop_bubble(
     Popping small bubbles from the genome_graph.
 
     Algorithm 6.
+
+    A bubble is defined as the isolated part of the genome from node A to node B
+    where there are multiple paths from A to B. The probe_distance here defines
+    how big a bubble can be.
+
+    We remove all of the bubble accept a chosen path in the bubble. This path
+    is chosen by greedily pick the largest edge when we traverse the bubble.
     """
     if len(genome_graph[start]) < 2:  # Cannot be the source of a bubble.
         return
@@ -951,7 +1116,9 @@ def create_unitigs(
     genome_graph: Genome_Graph, vertices: List[Vertex]
 ) -> Dict[str, List[Tuple[Vertex, int]]]:
     """
-    ...
+    Goes over the graph and when a path does not branches it merges the nodes of
+    that path. These mergings are saved in a dict and returned. This dict can
+    later be used to create the sequences that form the unitigs.
     """
 
     def utg_to_name(utg_nr: int) -> str:
@@ -1008,9 +1175,15 @@ def create_unitigs(
 # Print to file functions.
 
 
-def gfa(genome_graph, unitig_to_reads, read_seqs):
+def gfa(
+    genome_graph: Genome_Graph,
+    unitig_to_reads: Dict[str, List[Tuple[Vertex, int]]],
+    read_seqs: Dict[str, str],
+) -> Iterator[Tuple[str, ...]]:
     """
-    ...
+    This function takes the genome_graph that is completely cleaned and
+    with the reads, a dict to outlines how the unitigs are formed it will
+    output the genome assembly lines of the GFA file.
     """
 
     def get_ori(ori: bool) -> str:
@@ -1037,9 +1210,14 @@ def gfa(genome_graph, unitig_to_reads, read_seqs):
             yield "L", v[0], get_ori(v[1]), w[0], get_ori(w[1]), f"{maplen}M"
 
 
-def print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out):
+def print_gfa_file(
+    genome_graph: Genome_Graph,
+    unitig_to_reads: Dict[str, List[Tuple[Vertex, int]]],
+    read_seqs: Dict[str, str],
+    out: IO,
+):
     """
-    ...
+    Prints the GFA lines to the output file.
     """
     for line in gfa(genome_graph, unitig_to_reads, read_seqs):
         print(*line, sep="\t", file=out)
@@ -1060,23 +1238,28 @@ def miniasm(paf_file: IO, reads_file: IO, out: IO, args: Namespace):
         mappings, seq_lens, args.max_overhang, args.max_overhang_ratio
     )
 
-    vertices = list(genome_graph.keys())
-
     # Graph cleaning (2.3).
+
+    # Looping the keys-view, while modifying dict leads to bizarre behavior.
+    # Thus we make a copy of the vertices for every cleaning operation.
+
+    vertices = list(genome_graph.keys())
     remove_transitive_edges(genome_graph, vertices, seq_lens, args.fuzz)
 
-    # Looping the keys-view, while modifying dict leads to bizarre behavior, just don't.
+    vertices = list(genome_graph.keys())
     for v in vertices:
         remove_small_tip(genome_graph, args.min_size_tip, v)
 
+    vertices = list(genome_graph.keys())
     for start in vertices:
         pop_bubble(genome_graph, seq_lens, args.probe_distance, start)
 
+    vertices = list(genome_graph.keys())
     unitig_to_reads = create_unitigs(genome_graph, vertices)
 
     # Convert to gfa format
 
-    read_seqs = dict(read_fastx(reads_file, "fastq"))
+    read_seqs: Dict[str, str] = dict(read_fastx(reads_file))
 
     print_gfa_file(genome_graph, unitig_to_reads, read_seqs, out)
 
@@ -1101,23 +1284,24 @@ class TestSuite(unittest.TestCase):
         self.assertEqual(new_h, 9473421487448830983)
 
     def test_find_minimizers(self):
+        """
+        Note: As can be seen, here the coords are not the same as given in the
+        project page. The reason is that we only apply reversal of the coords
+        in the very end at the paf outputting. This is explained more in-depth
+        in the notes of the :func:`compute_minimizers` function and all the
+        details of reversal or dealt with in the :func:`map_query` function.
+        """
         seq = "GATTACAACT"
         minimizer_sketch = get_func_minimizer_sketch(w=4, k=3)
         self.assertEqual(
             minimizer_sketch(seq),
-            {(1396078460937419741, 6, True), (2859083004982788208, 3, True)},
+            {(1396078460937419741, 1, True), (2859083004982788208, 4, True)},
         )
-        # NB. In the test set the starting coords of the minimizers is
-        # reversed if the minimizer is found on the reverse strand.
-        # This is different from the given pseudocode which does not perform
-        # this reversal. Algo 4 will also not work if you perform the reversal.
-        # The reason for this is that the clustering is performed
-        # on i + i_t instead of i - i_t for opposite strands.
-        # Different strands use a different invariant to find minimizers
-        # with the same maplen, as shown below:
-        # The invariants:
-        # Same strand: i - i_t = qlen - maplen
-        # Opposite strand: i + i_t = qlen + tlen - maplen
+
+    def test_longest_increasing(self):
+        alist = [3, 1, 2, 5, 4, 8, 6]
+        indices = [1, 2, 4, 6]
+        self.assertEqual(longest_increasing_subset(alist), indices)
 
 
 if __name__ == "__main__":
@@ -1151,8 +1335,13 @@ if __name__ == "__main__":
     minimap_argparser.add_argument("query", type=argparse.FileType("r"))
 
     indexing = minimap_argparser.add_argument_group("Indexing options")
-    indexing.add_argument("-k", help="minimizer length", default=15)
-    indexing.add_argument("-w", help="minimizer window size (default is 2/3 of k).")
+    indexing.add_argument("-k", help="Minimizer length.", default=15, type=int)
+    indexing.add_argument(
+        "-w",
+        help="Minimizer window size (default is 2/3 of k).",
+        type=int,
+        default=argparse.SUPPRESS,
+    )
 
     mapping = minimap_argparser.add_argument_group("Mapping options")
     mapping.add_argument(
@@ -1214,8 +1403,8 @@ if __name__ == "__main__":
     )
     overlapping.add_argument(
         "-I",
-        "--max-overhang-ration",
-        help="Maximum overhang ration.",
+        "--max-overhang-ratio",
+        help="Maximum overhang ratio.",
         default=0.8,
         type=float,
     )
@@ -1227,7 +1416,13 @@ if __name__ == "__main__":
     graph.add_argument(
         "-e", "--min-size-tip", help="The minimum size of a tip", default=4, type=int
     )
-    graph.add_argument("-f", "--reads", type=argparse.FileType("r"), required=True)
+    graph.add_argument(
+        "-f",
+        "--reads",
+        type=argparse.FileType("r"),
+        required=True,
+        help="This is the read file. It is for now required.",
+    )
     graph.add_argument(
         "-d",
         "--probe-distance",
@@ -1244,7 +1439,10 @@ if __name__ == "__main__":
     if len(sys.argv) < 1:
         print("Debug mode for Python REPL.")
     elif sys.argv[1] not in subprograms:
-        print(f"You did not select a correct sub program: {subprograms}")
+        print(
+            "You did not select a correct sub program"
+            f" from the subprograms: {subprograms}"
+        )
         sys.exit(1)
     elif sys.argv[1] == "test":
         unittest.main(argv=["ignore-this"])
@@ -1253,8 +1451,6 @@ if __name__ == "__main__":
     else:
         args = parser.parse_args()
         if sys.argv[1] == "minimap":
-            if not args.w:
-                args.w = round(2 * args.k / 3)  # Default is 2 / 3 of k.
             minimap(args.target, args.query, args.out, args)
         elif sys.argv[1] == "miniasm":
             args.fuzz = 10  # Used by the removal of transitive edges

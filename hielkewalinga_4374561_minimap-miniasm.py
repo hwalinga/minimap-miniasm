@@ -27,7 +27,9 @@ The main program accepts a --help as well.
 NB.
 
 There is also a third subprogram, which is the 'test' subprogram. This will
-run the unittest included in this program.
+run the unittest included in this program. These unittest reflect the tests
+given on the project page of this project.
+https://abeellab.github.io/cs4255/minimap-doc.html
 
 There is also a fourth subprogram 'mytest', used for debugging.
 """
@@ -201,7 +203,7 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
     M : Minimizers
         The minimizers are a set with a tuple with the numbers m, i, r
         Where m is the hash integer,
-        i is the position
+        i is the position where the k-mer starts. (Also start position on reverse)
         r is the strand
     """
     kmers = sliding_windowing(s, k)
@@ -213,16 +215,23 @@ def compute_minimizers(s: str, w: int, k: int, hash_func: Seq_Hash) -> Minimizer
 
         # Find minimum k-mer
         m = sys.maxsize  # 2 ** 63 - 1 on 64 bit platforms.
+        print("START M")
         for j, kmer in enumerate(w_window):
+            print(kmer)
             u, v = hash_func(kmer), hash_func(reverse_complement(kmer))
+            print(u, v)
             if u != v:  # If reverse complement the same sequence, do not use.
                 m = min(m, u, v)
 
+        print(m)
         # Add minimizer
         for j, kmer in enumerate(w_window):
             u, v = hash_func(kmer), hash_func(reverse_complement(kmer))
             if u == m or v == m:
+                # NB. We do not reverse the coord here, but use different invariants
+                # for the opposite strands. See Algo 4: compute_minimizers
                 M.add((m, i + j, v < u))
+        print(M)
 
         # Move w window one k-mer further. (If not more k-mers, we are done.)
         new_kmer = next(kmers, None)
@@ -322,6 +331,12 @@ def map_query(
     # Collect minimizers hit
     for h, i, r in M:
         for t, i_t, r_t in H[h]:
+            # NB. For opposite strand the coord is not reversed,
+            # therefore use the invariants for the third element as such:
+            # Same strand: i - i_t = qlen - maplen
+            # Opposite strand: i + i_t = qlen + tlen - maplen
+            # The third element can now be used to group minimizers that create
+            # the same kind of mapping (i.e. that have the same maplen).
             if r == r_t:
                 A.append((t, 0, i - i_t, i_t))
             else:
@@ -336,12 +351,22 @@ def map_query(
             e + 1 == len(A)
             or A[e + 1][0] != A[e][0]
             or A[e + 1][1] != A[e][1]
+            # Here we perform single linkage if the link < args.epsilon
             or A[e + 1][2] - A[e][2] >= args.epsilon
         ):
+            # lh3/minimap also merges minimizers
+            # if there is a -m=50% overlap between the two, I do not.
+
             potential_overlap = A[b:e]
             b = e + 1
 
             indices = maximum_colinear_subset(map(itemgetter(3), potential_overlap))
+
+            # We have now a (potential) cluster that represents a mapping.
+            # Now use this cluster to create paf or reject the cluster.
+
+            # NB. lh3/minimap breaks this chain if
+            # there is a gap longer than -g=10000, I do not.
 
             if len(indices) < args.min_subset:
                 # Not enough minimizers in this mapping. Do not use.
@@ -1078,6 +1103,21 @@ class TestSuite(unittest.TestCase):
     def test_find_minimizers(self):
         seq = "GATTACAACT"
         minimizer_sketch = get_func_minimizer_sketch(w=4, k=3)
+        self.assertEqual(
+            minimizer_sketch(seq),
+            {(1396078460937419741, 6, True), (2859083004982788208, 3, True)},
+        )
+        # NB. In the test set the starting coords of the minimizers is
+        # reversed if the minimizer is found on the reverse strand.
+        # This is different from the given pseudocode which does not perform
+        # this reversal. Algo 4 will also not work if you perform the reversal.
+        # The reason for this is that the clustering is performed
+        # on i + i_t instead of i - i_t for opposite strands.
+        # Different strands use a different invariant to find minimizers
+        # with the same maplen, as shown below:
+        # The invariants:
+        # Same strand: i - i_t = qlen - maplen
+        # Opposite strand: i + i_t = qlen + tlen - maplen
 
 
 if __name__ == "__main__":
@@ -1125,7 +1165,8 @@ if __name__ == "__main__":
     mapping.add_argument(
         "-r",
         "--epsilon",
-        help="Maximum gap size between minimizers.",
+        help="Maximum gap size between minimizers. The bandwidth used in the"
+        " single linkage clustering.",
         default=500,
         type=int,
     )
@@ -1200,11 +1241,12 @@ if __name__ == "__main__":
 
     subprograms = {"minimap", "miniasm", "test", "mytest", "--help", "-h"}
 
-    if sys.argv[1] not in subprograms:
+    if len(sys.argv) < 1:
+        print("Debug mode for Python REPL.")
+    elif sys.argv[1] not in subprograms:
         print(f"You did not select a correct sub program: {subprograms}")
         sys.exit(1)
-
-    if sys.argv[1] == "test":
+    elif sys.argv[1] == "test":
         unittest.main(argv=["ignore-this"])
     elif sys.argv[1] == "mytest":
         mytest()
